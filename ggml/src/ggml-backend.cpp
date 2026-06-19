@@ -1546,6 +1546,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
 
+    // [SYNC_COUNT] env-gated instrumentation of cross-backend host-blocking sync sites.
+    // Counts only syncs that flush a GPU stream (= pipeline flushes). No effect on results.
+    static const int dbg_sync = []{ const char * e = getenv("GGML_SCHED_SYNC_COUNT"); return e ? atoi(e) : 0; }();
+    static long long g_calls=0, g_war=0, g_inp=0, g_moe_ib=0, g_moe_ids=0, g_gen_ib=0, g_gen_sp=0, g_splits=0, g_xin=0;
+    long long c_war=0,c_inp=0,c_moe_ib=0,c_moe_ids=0,c_gen_ib=0,c_gen_sp=0,c_xin=0;
+    auto dbg_is_gpu = [](ggml_backend_t b){ return ggml_backend_dev_type(ggml_backend_get_device(b)) != GGML_BACKEND_DEVICE_TYPE_CPU; };
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
@@ -1557,20 +1564,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
+            if (dbg_sync && dbg_is_gpu(split_backend)) c_xin++;
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                    if (dbg_sync && dbg_is_gpu(split_backend)) c_inp++;
                 } else {
                     ggml_backend_synchronize(split_backend);
+                    if (dbg_sync && dbg_is_gpu(split_backend)) c_inp++;
                 }
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+                    // event_wait is a stream wait (not a host block) => not counted
                 } else {
                     ggml_backend_synchronize(split_backend);
+                    if (dbg_sync && dbg_is_gpu(split_backend)) c_war++;
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
@@ -1586,6 +1598,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
 
                     ggml_backend_synchronize(input_backend);
+                    if (dbg_sync && dbg_is_gpu(input_backend)) c_moe_ib++;
 
                     // get the ids
                     ggml_tensor * ids_tensor = node->src[2];
@@ -1605,6 +1618,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
                         ggml_backend_synchronize(ids_backend);
+                        if (dbg_sync && dbg_is_gpu(ids_backend)) c_moe_ids++;
 
                         // find the used experts
                         used_ids.clear();
@@ -1663,10 +1677,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
                         ggml_backend_synchronize(input_backend);
+                        if (dbg_sync && dbg_is_gpu(input_backend)) c_gen_ib++;
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                            if (dbg_sync && dbg_is_gpu(split_backend)) c_gen_sp++;
                         } else {
                             ggml_backend_synchronize(split_backend);
+                            if (dbg_sync && dbg_is_gpu(split_backend)) c_gen_sp++;
                         }
                         ggml_backend_tensor_copy(input, input_cpy);
                     }
@@ -1718,6 +1735,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
             }
+        }
+    }
+
+    if (dbg_sync) {
+        g_calls++; g_war+=c_war; g_inp+=c_inp; g_moe_ib+=c_moe_ib; g_moe_ids+=c_moe_ids;
+        g_gen_ib+=c_gen_ib; g_gen_sp+=c_gen_sp; g_splits+=sched->n_splits; g_xin+=c_xin;
+        long long tot = c_war+c_inp+c_moe_ib+c_moe_ids+c_gen_ib+c_gen_sp;
+        if (g_calls <= 5 || dbg_sync >= 2) {
+            fprintf(stderr, "[SYNC_COUNT] call#%lld splits=%d xin=%lld GPU-syncs=%lld {war=%lld inp=%lld moe_ib=%lld moe_ids=%lld gen_ib=%lld gen_sp=%lld}\n",
+                g_calls, sched->n_splits, c_xin, tot, c_war, c_inp, c_moe_ib, c_moe_ids, c_gen_ib, c_gen_sp);
+        }
+        if (g_calls % 64 == 0) {
+            fprintf(stderr, "[SYNC_COUNT] CUMUL/call over %lld: splits=%.1f xin=%.1f war=%.2f inp=%.2f moe_ib=%.2f moe_ids=%.2f gen_ib=%.2f gen_sp=%.2f TOT=%.2f\n",
+                g_calls, (double)g_splits/g_calls, (double)g_xin/g_calls, (double)g_war/g_calls, (double)g_inp/g_calls,
+                (double)g_moe_ib/g_calls, (double)g_moe_ids/g_calls, (double)g_gen_ib/g_calls, (double)g_gen_sp/g_calls,
+                (double)(g_war+g_inp+g_moe_ib+g_moe_ids+g_gen_ib+g_gen_sp)/g_calls);
         }
     }
 
