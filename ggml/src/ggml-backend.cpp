@@ -1552,11 +1552,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     static long long g_calls=0, g_war=0, g_inp=0, g_moe_ib=0, g_moe_ids=0, g_gen_ib=0, g_gen_sp=0, g_splits=0, g_xin=0;
     long long c_war=0,c_inp=0,c_moe_ib=0,c_moe_ids=0,c_gen_ib=0,c_gen_sp=0,c_xin=0;
     auto dbg_is_gpu = [](ggml_backend_t b){ return ggml_backend_dev_type(ggml_backend_get_device(b)) != GGML_BACKEND_DEVICE_TYPE_CPU; };
+    // [SYNC_TIME] dbg_sync>=3: per-token wall-clock buckets (us). Decisive for overlap:
+    //   in_gpu  = time host blocked in GPU splits' input loop (sync waits incl. join wait for GPU branch)
+    //   cmp_cpu = time host blocked in CPU graph_compute (= CPU expert branch work, CPU is blocking)
+    //   cmp_gpu = time in GPU graph_compute_async (should be ~0; large = CUDA-graph replay sync / copy)
+    //   in_cpu  = time in CPU splits' input loop (GPU->CPU pre-stage waits)
+    // If in_gpu is large vs cmp_cpu => GPU branch is the bottleneck (copy-bound) => dual-GPU.
+    static long long gk_in_gpu=0, gk_in_cpu=0, gk_cmp_cpu=0, gk_cmp_gpu=0;
+    long long tk_in_gpu=0, tk_in_cpu=0, tk_cmp_cpu=0, tk_cmp_gpu=0;
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        int64_t tk_t0 = (dbg_sync >= 3) ? ggml_time_us() : 0;
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1691,6 +1700,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (dbg_sync >= 3) {
+            long long d = ggml_time_us() - tk_t0;
+            if (dbg_is_gpu(split_backend)) tk_in_gpu += d; else tk_in_cpu += d;
+            tk_t0 = ggml_time_us();
+        }
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -1730,6 +1744,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (dbg_sync >= 3) {
+            long long d = ggml_time_us() - tk_t0;
+            if (dbg_is_gpu(split_backend)) tk_cmp_gpu += d; else tk_cmp_cpu += d;
+        }
+
         // record the event of this copy
         if (split->n_inputs > 0) {
             if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -1751,6 +1770,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 g_calls, (double)g_splits/g_calls, (double)g_xin/g_calls, (double)g_war/g_calls, (double)g_inp/g_calls,
                 (double)g_moe_ib/g_calls, (double)g_moe_ids/g_calls, (double)g_gen_ib/g_calls, (double)g_gen_sp/g_calls,
                 (double)(g_war+g_inp+g_moe_ib+g_moe_ids+g_gen_ib+g_gen_sp)/g_calls);
+        }
+        if (dbg_sync >= 3) {
+            gk_in_gpu+=tk_in_gpu; gk_in_cpu+=tk_in_cpu; gk_cmp_cpu+=tk_cmp_cpu; gk_cmp_gpu+=tk_cmp_gpu;
+            if (g_calls <= 5 || g_calls % 64 == 0) {
+                fprintf(stderr, "[SYNC_TIME] call#%lld us/token: in_gpu(GPUwait)=%lld cmp_cpu(CPUbranch)=%lld cmp_gpu=%lld in_cpu(prestage)=%lld | CUMUL/call in_gpu=%.0f cmp_cpu=%.0f cmp_gpu=%.0f in_cpu=%.0f\n",
+                    g_calls, tk_in_gpu, tk_cmp_cpu, tk_cmp_gpu, tk_in_cpu,
+                    (double)gk_in_gpu/g_calls, (double)gk_cmp_cpu/g_calls, (double)gk_cmp_gpu/g_calls, (double)gk_in_cpu/g_calls);
+            }
         }
     }
 
