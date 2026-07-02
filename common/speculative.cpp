@@ -850,6 +850,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<llama_tokens> pending_verify_tokens;
     std::vector<std::vector<llama_pos>> pending_verify_pos;
     std::vector<std::vector<float>> pending_verify_seed_h;
+    std::vector<uint16_t> pending_verify_n_accepted;
 
     // Per-seq draft length from the last draft() call. The deferred MTP
     // mirror path uses this to recognize verifier batches; the adaptive
@@ -865,6 +866,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     size_t n_deferred_batches = 0;
     size_t n_deferred_rows    = 0;
     size_t n_deferred_replayed_rows = 0;
+    size_t n_deferred_fused_seed_outputs = 0;
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
@@ -940,6 +942,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         pending_verify_tokens.assign(n_seq, {});
         pending_verify_pos.assign(n_seq, {});
         pending_verify_seed_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+        pending_verify_n_accepted.assign(n_seq, 0);
 
         last_n_drafted.assign(n_seq, 0);
     }
@@ -996,12 +999,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     h_row, (size_t) n_embd * sizeof(float));
     }
 
-    void replay_deferred_prefix(llama_seq_id seq_id, uint16_t n_accepted) {
+    int32_t add_deferred_prefix(llama_seq_id seq_id, uint16_t n_accepted, bool output_last) {
         if (!pending_verify_active[seq_id]) {
-            return;
+            return 0;
         }
 
-        auto * ctx_dft = this->params.ctx_dft;
         const int32_t n_rows = verify_h_rows[seq_id];
         const int32_t n_replay = std::min<int32_t>(
                 std::min<int32_t>((int32_t) n_accepted + 1, n_rows),
@@ -1009,25 +1011,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         if (n_replay <= 0) {
             pending_verify_active[seq_id] = false;
-            return;
+            return 0;
         }
 
-        common_batch_clear(batch);
         for (int32_t i = 0; i < n_replay; ++i) {
             const float * h_row = i == 0
                 ? pending_verify_seed_h[seq_id].data()
                 : verify_h[seq_id].data() + (size_t) (i - 1) * n_embd;
             add_mtp_row(seq_id, pending_verify_tokens[seq_id][i], pending_verify_pos[seq_id][i], h_row);
-        }
-
-        const int32_t rc = llama_decode(ctx_dft, batch);
-        if (rc != 0) {
-            GGML_ABORT("%s", string_format("%s: deferred MTP replay failed rc=%d (seq_id=%d, n_replay=%d)\n",
-                    __func__, (int) rc, (int) seq_id, (int) n_replay).c_str());
+            batch.logits[batch.n_tokens - 1] = output_last && i == n_replay - 1;
         }
 
         n_deferred_replayed_rows += n_replay;
         pending_verify_active[seq_id] = false;
+        return output_last ? 1 : 0;
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -1042,6 +1039,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         low_yield_disabled[seq_id] = false;
         low_yield_streak[seq_id] = 0;
         last_n_drafted[seq_id] = 0;
+        pending_verify_active[seq_id] = false;
 
         if (pos_max < N - 1 && !is_mem_shared) {
             LOG_WRN("%s: ctx_dft pos_max=%d < N-1=%d - "
@@ -1110,6 +1108,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     pending_verify_tokens[seq_id].assign(batch_in.token + beg, batch_in.token + end + 1);
                     pending_verify_pos[seq_id].assign(batch_in.pos + beg, batch_in.pos + end + 1);
                     std::memcpy(pending_verify_seed_h[seq_id].data(), pending_h[seq_id].data(), row_bytes);
+                    pending_verify_n_accepted[seq_id] = 0;
                     n_deferred_batches++;
                     n_deferred_rows += n_rows;
                     continue;
@@ -1186,10 +1185,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 cpu_sampler_ready[seq_id] = true;
             }
 
-            add_mtp_token(seq_id, dp.id_last, dp.n_past, true);
+            int32_t n_seed_outputs = 0;
+            if (pending_verify_active[seq_id]) {
+                const uint16_t n_accepted = pending_verify_n_accepted[seq_id];
+                n_seed_outputs = add_deferred_prefix(seq_id, n_accepted, true);
+                n_deferred_fused_seed_outputs += n_seed_outputs;
+            }
+            if (n_seed_outputs == 0) {
+                add_mtp_token(seq_id, dp.id_last, dp.n_past, true);
 
-            h_row = pending_h[seq_id].data();
-            std::memcpy(batch.embd + n_embd*(batch.n_tokens - 1), h_row, row_bytes);
+                h_row = pending_h[seq_id].data();
+                std::memcpy(batch.embd + n_embd*(batch.n_tokens - 1), h_row, row_bytes);
+            }
         }
 
         if (batch.n_tokens == 0) {
@@ -1336,7 +1343,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
-        replay_deferred_prefix(seq_id, n_accepted);
+        if (pending_verify_active[seq_id]) {
+            pending_verify_n_accepted[seq_id] = n_accepted;
+        }
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
 
         if (params.low_yield_fallback > 0 && last_n_drafted[seq_id] > 0) {
@@ -1374,6 +1383,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         oss << ", deferred batches = " << n_deferred_batches;
         oss << ", deferred rows = " << n_deferred_rows;
         oss << ", deferred replayed rows = " << n_deferred_replayed_rows;
+        oss << ", deferred fused seed outputs = " << n_deferred_fused_seed_outputs;
         oss << ", deferred saved rows = "
             << (n_deferred_rows >= n_deferred_replayed_rows ? n_deferred_rows - n_deferred_replayed_rows : 0);
         return oss.str();
