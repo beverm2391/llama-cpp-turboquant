@@ -95,6 +95,8 @@ struct llama_context {
     llama_token * get_target_mtp_tokens() const;
     uint32_t      get_target_mtp_tokens_count() const;
     llama_token   get_target_mtp_token_ith(int32_t idx);
+    void          record_target_mtp_output_sync(uint64_t elapsed_us);
+    void          get_target_mtp_output_stats(llama_target_mtp_output_stats * stats) const;
 
     float * get_sampled_logits_ith(int32_t idx);
     size_t  get_sampled_logits_count(int32_t idx);
@@ -301,6 +303,12 @@ private:
     // Target-context GLM MTP draft token ids copied from the graph result.
     // This avoids the eval-callback side channel for target-mtp speculation.
     buffer_view<llama_token> target_mtp = {nullptr, 0};
+    uint64_t target_mtp_output_copy_calls = 0;
+    uint64_t target_mtp_output_copy_tokens = 0;
+    uint64_t target_mtp_output_copy_bytes = 0;
+    uint64_t target_mtp_output_copy_us = 0;
+    uint64_t target_mtp_output_sync_calls = 0;
+    uint64_t target_mtp_output_sync_us = 0;
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true

@@ -906,6 +906,24 @@ uint32_t llama_context::get_target_mtp_tokens_count() const {
     return target_mtp.has_data() ? n_outputs : 0;
 }
 
+void llama_context::record_target_mtp_output_sync(uint64_t elapsed_us) {
+    target_mtp_output_sync_us += elapsed_us;
+    target_mtp_output_sync_calls++;
+}
+
+void llama_context::get_target_mtp_output_stats(llama_target_mtp_output_stats * stats) const {
+    if (stats == nullptr) {
+        return;
+    }
+
+    stats->copy_calls = target_mtp_output_copy_calls;
+    stats->copy_tokens = target_mtp_output_copy_tokens;
+    stats->copy_bytes = target_mtp_output_copy_bytes;
+    stats->copy_us = target_mtp_output_copy_us;
+    stats->sync_calls = target_mtp_output_sync_calls;
+    stats->sync_us = target_mtp_output_sync_us;
+}
+
 llama_token llama_context::get_target_mtp_token_ith(int32_t idx) {
     output_reorder();
 
@@ -2059,12 +2077,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 GGML_ASSERT(n_outputs_prev + n_tokens <= target_mtp.size);
                 GGML_ASSERT(ggml_is_contiguous(t_target_mtp) && "target MTP token tensor must be contiguous for async copy");
 
+                const int64_t t_start_target_mtp_copy = ggml_time_us();
+                const size_t n_bytes = n_tokens * sizeof(target_mtp.data[0]);
                 ggml_backend_tensor_get_async(
                     backend_mtp,
                     t_target_mtp,
                     target_mtp.data + n_outputs_prev,
                     0,
-                    n_tokens * sizeof(target_mtp.data[0]));
+                    n_bytes);
+                target_mtp_output_copy_us += ggml_time_us() - t_start_target_mtp_copy;
+                target_mtp_output_copy_calls++;
+                target_mtp_output_copy_tokens += n_tokens;
+                target_mtp_output_copy_bytes += n_bytes;
             }
         }
 
@@ -3852,13 +3876,17 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
 }
 
 llama_token * llama_get_target_mtp_tokens(llama_context * ctx) {
+    const int64_t t_start_sync = ggml_time_us();
     ctx->synchronize();
+    ctx->record_target_mtp_output_sync(ggml_time_us() - t_start_sync);
 
     return ctx->get_target_mtp_tokens();
 }
 
 llama_token * llama_get_target_mtp_tokens_with_count(llama_context * ctx, uint32_t * n_tokens) {
+    const int64_t t_start_sync = ggml_time_us();
     ctx->synchronize();
+    ctx->record_target_mtp_output_sync(ggml_time_us() - t_start_sync);
 
     if (n_tokens != nullptr) {
         *n_tokens = ctx->get_target_mtp_tokens_count();
@@ -3868,15 +3896,27 @@ llama_token * llama_get_target_mtp_tokens_with_count(llama_context * ctx, uint32
 }
 
 uint32_t llama_get_target_mtp_tokens_count(llama_context * ctx) {
+    const int64_t t_start_sync = ggml_time_us();
     ctx->synchronize();
+    ctx->record_target_mtp_output_sync(ggml_time_us() - t_start_sync);
 
     return ctx->get_target_mtp_tokens_count();
 }
 
 llama_token llama_get_target_mtp_token_ith(llama_context * ctx, int32_t i) {
+    const int64_t t_start_sync = ggml_time_us();
     ctx->synchronize();
+    ctx->record_target_mtp_output_sync(ggml_time_us() - t_start_sync);
 
     return ctx->get_target_mtp_token_ith(i);
+}
+
+void llama_get_target_mtp_output_stats(llama_context * ctx, llama_target_mtp_output_stats * stats) {
+    if (ctx == nullptr || stats == nullptr) {
+        return;
+    }
+
+    ctx->get_target_mtp_output_stats(stats);
 }
 
 float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {

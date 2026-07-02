@@ -109,6 +109,17 @@ LLAMA_API llama_token * llama_get_target_mtp_tokens_with_count(struct llama_cont
 LLAMA_API uint32_t      llama_get_target_mtp_tokens_count(struct llama_context * ctx);
 LLAMA_API llama_token   llama_get_target_mtp_token_ith(struct llama_context * ctx, int32_t i);
 
+struct llama_target_mtp_output_stats {
+    uint64_t copy_calls;
+    uint64_t copy_tokens;
+    uint64_t copy_bytes;
+    uint64_t copy_us;
+    uint64_t sync_calls;
+    uint64_t sync_us;
+};
+
+LLAMA_API void llama_get_target_mtp_output_stats(struct llama_context * ctx, llama_target_mtp_output_stats * stats);
+
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 
