@@ -42,9 +42,13 @@ void llama_model_glm_dsa::load_arch_hparams(llama_model_loader & ml) {
     }
 }
 
-void llama_model_glm_dsa::load_arch_tensors(llama_model_loader &) {
+void llama_model_glm_dsa::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
     const int64_t n_expert_shared = hparams.n_expert_shared;
+
+    const std::string mtp_probe = "blk." + std::to_string(n_layer) + ".nextn.eh_proj.weight";
+    const bool trunk_only = (hparams.n_layer_nextn > 0) && (ml.get_weight(mtp_probe.c_str()) == nullptr);
+    const int mtp_flags = trunk_only ? TENSOR_NOT_REQUIRED : 0;
 
     const bool is_mla = hparams.is_mla();
     if (!is_mla) {
@@ -74,12 +78,7 @@ void llama_model_glm_dsa::load_arch_tensors(llama_model_loader &) {
     }
 
     for (int i = 0; i < n_layer_all; ++i) {
-        int flags = 0;
-        if (i >= n_layer) {
-            // skip all tensors in the NextN layers
-            // TODO @ngxson : TENSOR_NOT_REQUIRED was a hack, need to remove it later
-            flags |= TENSOR_SKIP | TENSOR_NOT_REQUIRED;
-        }
+        const int flags = i >= n_layer ? mtp_flags : 0;
 
         auto & layer = layers[i];
 
@@ -132,7 +131,7 @@ void llama_model_glm_dsa::load_arch_tensors(llama_model_loader &) {
             layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_exp * n_expert_shared}, flags);
         }
 
-        // NextN/MTP tensors (preserved but unused) - conditionally load for last n_layer_nextn
+        // NextN/MTP tensors for extra draft decoder blocks.
         if (i >= n_layer) {
             layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", i), { 2 * n_embd, n_embd }, flags);
             layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM, "weight", i), { n_embd }, flags);
@@ -147,6 +146,200 @@ void llama_model_glm_dsa::load_arch_tensors(llama_model_loader &) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_glm_dsa::build_arch_graph(const llm_graph_params & params) const {
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
+        return std::make_unique<graph_mtp>(*this, params);
+    }
     return std::make_unique<graph>(*this, params);
 }
 
+llama_model_glm_dsa::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params) :
+    llm_graph_context(params) {
+    GGML_ASSERT(hparams.is_mla() && "GLM_DSA MTP requires MLA");
+    GGML_ASSERT(hparams.n_layer_nextn > 0 && "GLM_DSA MTP requires n_layer_nextn > 0");
+    GGML_ASSERT(hparams.n_layer_nextn == 1 && "GLM_DSA MTP currently supports one NextN block");
+
+    const int il = hparams.n_layer();
+    const auto & layer = model.layers[il];
+
+    GGML_ASSERT(layer.nextn.eh_proj && "GLM_DSA MTP block missing nextn.eh_proj");
+    GGML_ASSERT(layer.nextn.enorm   && "GLM_DSA MTP block missing nextn.enorm");
+    GGML_ASSERT(layer.nextn.hnorm   && "GLM_DSA MTP block missing nextn.hnorm");
+
+    const int64_t n_embd_head_k_mla = hparams.n_embd_head_k_mla();
+    const int64_t n_embd_head_qk_rope = hparams.n_rot();
+    const int64_t n_embd_head_qk_nope = n_embd_head_k_mla - n_embd_head_qk_rope;
+    const uint32_t kv_lora_rank = hparams.n_lora_kv;
+
+    GGML_ASSERT(ext_factor >= 0.0f);
+    const float attn_factor_org = attn_factor * (1.0f + 0.1f * logf(1.0f / freq_scale));
+    const float mscale   = attn_factor_org * (1.0f + 0.1f * hparams.rope_yarn_log_mul * logf(1.0f / freq_scale));
+    const float kq_scale = mscale * mscale / sqrtf(float(n_embd_head_k_mla));
+
+    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd);
+
+    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(inp->tokens);
+
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
+    ggml_set_input(inp->embd);
+
+    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+    ggml_set_input(inp->h);
+    ggml_set_name(inp->h, "mtp_h_input");
+
+    ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
+    ggml_tensor * tok_embd = ubatch.token ? ggml_get_rows(ctx0, tok_embd_w, inp->tokens) : inp->embd;
+    cb(tok_embd, "mtp_tok_embd", il);
+
+    ggml_tensor * h_embd = inp->h;
+    res->add_input(std::move(inp));
+
+    ggml_tensor * inp_pos = build_inp_pos();
+    auto * inp_attn_k = build_attn_inp_k();
+
+    ggml_tensor * h_norm = build_norm(h_embd, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
+    cb(h_norm, "mtp_hnorm", il);
+
+    ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
+    cb(e_norm, "mtp_enorm", il);
+
+    ggml_tensor * concat = ggml_concat(ctx0, e_norm, h_norm, 0);
+    cb(concat, "mtp_concat", il);
+
+    ggml_tensor * cur = ggml_mul_mat(ctx0, layer.nextn.eh_proj, concat);
+    cb(cur, "mtp_eh_proj", il);
+
+    ggml_tensor * inpSA = cur;
+
+    cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+    cb(cur, "mtp_attn_norm", il);
+
+    ggml_tensor * q = ggml_mul_mat(ctx0, layer.wq_a, cur);
+    cb(q, "mtp_q_a", il);
+
+    q = build_norm(q, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
+    cb(q, "mtp_q_a_norm", il);
+
+    q = ggml_mul_mat(ctx0, layer.wq_b, q);
+    cb(q, "mtp_q_b", il);
+
+    ggml_tensor * q_nope = ggml_view_3d(ctx0, q, n_embd_head_qk_nope, n_head, n_tokens,
+            ggml_row_size(q->type, n_embd_head_k_mla),
+            ggml_row_size(q->type, n_embd_head_k_mla) * n_head, 0);
+    cb(q_nope, "mtp_q_nope", il);
+
+    ggml_tensor * q_pe = ggml_view_3d(ctx0, q, n_embd_head_qk_rope, n_head, n_tokens,
+            ggml_row_size(q->type, n_embd_head_k_mla),
+            ggml_row_size(q->type, n_embd_head_k_mla) * n_head,
+            ggml_row_size(q->type, n_embd_head_qk_nope));
+    cb(q_pe, "mtp_q_pe", il);
+
+    ggml_tensor * kv_cmpr_pe = ggml_mul_mat(ctx0, layer.wkv_a_mqa, cur);
+    cb(kv_cmpr_pe, "mtp_kv_cmpr_pe", il);
+
+    ggml_tensor * kv_cmpr = ggml_view_2d(ctx0, kv_cmpr_pe, kv_lora_rank, n_tokens,
+            ggml_row_size(kv_cmpr_pe->type, kv_lora_rank + n_embd_head_qk_rope), 0);
+    cb(kv_cmpr, "mtp_kv_cmpr", il);
+
+    ggml_tensor * k_pe = ggml_view_3d(ctx0, kv_cmpr_pe, n_embd_head_qk_rope, 1, n_tokens,
+            ggml_row_size(kv_cmpr_pe->type, kv_lora_rank + n_embd_head_qk_rope),
+            ggml_row_size(kv_cmpr_pe->type, kv_lora_rank + n_embd_head_qk_rope),
+            ggml_row_size(kv_cmpr_pe->type, kv_lora_rank));
+    cb(k_pe, "mtp_k_pe", il);
+
+    q_pe = ggml_rope_ext(ctx0, q_pe, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow);
+    cb(q_pe, "mtp_q_pe_rope", il);
+
+    k_pe = ggml_rope_ext(ctx0, k_pe, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow);
+    cb(k_pe, "mtp_k_pe_rope", il);
+
+    kv_cmpr = build_norm(kv_cmpr, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
+    cb(kv_cmpr, "mtp_kv_cmpr_norm", il);
+
+    q_nope = ggml_permute(ctx0, q_nope, 0, 2, 1, 3);
+    cb(q_nope, "mtp_q_nope_perm", il);
+
+    ggml_tensor * q_nope_absorbed = ggml_mul_mat(ctx0, layer.wk_b, q_nope);
+    cb(q_nope_absorbed, "mtp_q_nope_absorbed", il);
+
+    q_nope_absorbed = ggml_permute(ctx0, q_nope_absorbed, 0, 2, 1, 3);
+    cb(q_nope_absorbed, "mtp_q_nope_absorbed_perm", il);
+
+    ggml_tensor * Qcur = ggml_concat(ctx0, q_nope_absorbed, q_pe, 0);
+    cb(Qcur, "mtp_Qcur", il);
+
+    kv_cmpr = ggml_reshape_3d(ctx0, kv_cmpr, kv_lora_rank, 1, n_tokens);
+    cb(kv_cmpr, "mtp_kv_cmpr_reshape", il);
+
+    ggml_tensor * Kcur = ggml_concat(ctx0, kv_cmpr, k_pe, 0);
+    cb(Kcur, "mtp_Kcur", il);
+
+    ggml_tensor * Vcur = kv_cmpr;
+    cb(Vcur, "mtp_Vcur", il);
+
+    cur = build_attn(inp_attn_k,
+            layer.wo, nullptr, layer.wo_s,
+            Qcur, Kcur, Vcur, nullptr, nullptr, layer.wv_b, kq_scale, il);
+    cb(cur, "mtp_attn_out", il);
+
+    ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
+    cb(ffn_inp, "mtp_ffn_inp", il);
+
+    cur = build_norm(ffn_inp, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
+    cb(cur, "mtp_ffn_norm", il);
+
+    if ((uint32_t) il < hparams.n_layer_dense_lead) {
+        cur = build_ffn(cur,
+                layer.ffn_up, nullptr, nullptr,
+                layer.ffn_gate, nullptr, nullptr,
+                layer.ffn_down, nullptr, nullptr,
+                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+        cb(cur, "mtp_ffn_out", il);
+    } else {
+        ggml_tensor * moe_out = build_moe_ffn(cur,
+                layer.ffn_gate_inp,
+                layer.ffn_up_exps,
+                layer.ffn_gate_exps,
+                layer.ffn_down_exps,
+                layer.ffn_exp_probs_b,
+                n_expert, n_expert_used,
+                LLM_FFN_SILU, hparams.expert_weights_norm,
+                hparams.expert_weights_scale,
+                (llama_expert_gating_func_type) hparams.expert_gating_func,
+                il,
+                nullptr,
+                layer.ffn_gate_up_exps);
+        cb(moe_out, "mtp_ffn_moe_out", il);
+
+        ggml_tensor * ffn_shexp = build_ffn(cur,
+                layer.ffn_up_shexp, nullptr, nullptr,
+                layer.ffn_gate_shexp, nullptr, nullptr,
+                layer.ffn_down_shexp, nullptr, nullptr,
+                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+        cb(ffn_shexp, "mtp_ffn_shexp", il);
+
+        cur = ggml_add(ctx0, moe_out, ffn_shexp);
+        cb(cur, "mtp_ffn_out", il);
+    }
+
+    cur = ggml_add(ctx0, cur, ffn_inp);
+    cb(cur, "mtp_post_ffn", il);
+
+    res->t_h_nextn = cur;
+    cb(cur, "h_nextn", -1);
+
+    ggml_tensor * head_norm_w = layer.nextn.shared_head_norm ? layer.nextn.shared_head_norm : model.output_norm;
+    GGML_ASSERT(head_norm_w && "GLM_DSA MTP: missing both nextn.shared_head_norm and output_norm");
+    cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
+    cb(cur, "mtp_shared_head_norm", -1);
+
+    ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+    GGML_ASSERT(head_w && "GLM_DSA MTP: missing LM head (nextn.shared_head_head or model.output)");
+    cur = ggml_mul_mat(ctx0, head_w, cur);
+    cb(cur, "result_output", -1);
+
+    res->t_logits = cur;
+    ggml_build_forward_expand(gf, cur);
+}
