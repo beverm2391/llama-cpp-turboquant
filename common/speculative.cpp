@@ -164,6 +164,8 @@ struct common_speculative_impl {
 
     // true if this implementation requires the target context to extract pre-norm embeddings
     virtual bool need_embd_nextn() const { return false; }
+
+    virtual std::string stats_extra() const { return ""; }
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -845,6 +847,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // pre-advancement before process() mirrored the verify batch.
     std::vector<uint16_t> last_n_drafted;
 
+    size_t n_backend_sampled  = 0;
+    size_t n_backend_missed   = 0;
+    size_t n_cpu_sampled      = 0;
+    size_t n_cpu_sampler_init = 0;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
         , params(params.draft)
@@ -874,16 +881,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
 
         smpls.resize(n_seq);
-        for (auto & s : smpls) {
-            common_params_sampling sparams;
-            sparams.no_perf  = false;
-            // MTP proposals are verified by the target model before they can
-            // affect output. Greedy proposals maximize reproducibility and
-            // acceptance for deterministic serving profiles such as GLM-5.2.
-            sparams.top_k    = 1;
-            sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
-            s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
-        }
 
         // offload draft sampling to the backend
         backend_chains.assign(n_seq, nullptr);
@@ -920,6 +917,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         verify_h_rows.assign(n_seq, 0);
 
         last_n_drafted.assign(n_seq, 0);
+    }
+
+    common_sampler * cpu_sampler(llama_seq_id seq_id) {
+        auto & smpl = smpls.at(seq_id);
+        if (smpl == nullptr) {
+            common_params_sampling sparams;
+            sparams.no_perf  = false;
+            // MTP proposals are verified by the target model before they can
+            // affect output. Greedy proposals maximize reproducibility and
+            // acceptance for deterministic serving profiles such as GLM-5.2.
+            sparams.top_k    = 1;
+            sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+            smpl.reset(common_sampler_init(llama_get_model(params.ctx_dft), sparams));
+            n_cpu_sampler_init++;
+        }
+        return smpl.get();
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1061,6 +1074,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // keep track of which sequences are still drafting
         int n_drafting = 0;
         std::vector<bool> drafting(n_seq);
+        std::vector<bool> cpu_sampler_ready(n_seq, false);
 
         const float * h_row = nullptr;
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
@@ -1074,7 +1088,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             n_drafting++;
             drafting[seq_id] = true;
-            common_sampler_reset(smpls[seq_id].get());
+            if (backend_chains[seq_id] == nullptr || params.p_min > 0.0f) {
+                common_sampler_reset(cpu_sampler(seq_id));
+                cpu_sampler_ready[seq_id] = true;
+            }
 
             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
 
@@ -1106,18 +1123,28 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 if (use_backend_fast) {
                     id = llama_get_sampled_token_ith(ctx_dft, i_batch);
                     if (id == LLAMA_TOKEN_NULL) {
+                        n_backend_missed++;
                         LOG_DBG("%s: backend greedy did not return a token for seq_id=%d; falling back to CPU sampler\n",
                                 __func__, (int) seq_id);
+                    } else {
+                        n_backend_sampled++;
                     }
                 }
 
                 auto * smpl = smpls[seq_id].get();
-                const llama_token id_sampled = id != LLAMA_TOKEN_NULL
-                    ? id
-                    : common_sampler_sample(smpl, ctx_dft, i_batch, true);
+                llama_token id_sampled = id;
+                if (id_sampled == LLAMA_TOKEN_NULL) {
+                    smpl = cpu_sampler(seq_id);
+                    if (!cpu_sampler_ready[seq_id]) {
+                        common_sampler_reset(smpl);
+                        cpu_sampler_ready[seq_id] = true;
+                    }
+                    id_sampled = common_sampler_sample(smpl, ctx_dft, i_batch, true);
+                    n_cpu_sampled++;
+                }
                 ++i_batch;
 
-                if (id != LLAMA_TOKEN_NULL) {
+                if (id != LLAMA_TOKEN_NULL && smpl != nullptr) {
                     common_sampler_accept(smpl, id, true);
                 }
 
@@ -1221,6 +1248,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     bool need_embd_nextn() const override {
         return true;
+    }
+
+    std::string stats_extra() const override {
+        std::ostringstream oss;
+        oss << ", backend samples = " << n_backend_sampled;
+        oss << ", backend misses = " << n_backend_missed;
+        oss << ", cpu samples = " << n_cpu_sampled;
+        oss << ", cpu sampler init = " << n_cpu_sampler_init;
+        return oss.str();
     }
 };
 
@@ -2125,13 +2161,16 @@ void common_speculative_print_stats(const common_speculative * spec) {
             str_perf = "";
         }
 
-        LOG_INF("statistics %16s: #calls(b,g,a) = %4zu %6zu %6zu, #gen drafts = %6zu, #acc drafts = %5zu, #gen tokens = %6zu, #acc tokens = %5zu%s\n",
+        const std::string stats_extra = impl->stats_extra();
+
+        LOG_INF("statistics %16s: #calls(b,g,a) = %4zu %6zu %6zu, #gen drafts = %6zu, #acc drafts = %5zu, #gen tokens = %6zu, #acc tokens = %5zu%s%s\n",
                 common_speculative_type_to_str(impl->type).c_str(),
                 impl->n_call_begin, impl->n_call_draft, impl->n_call_accept,
                 impl->n_gen_drafts,
                 impl->n_acc_drafts,
                 impl->n_gen_tokens,
                 impl->n_acc_tokens,
-                str_perf.c_str());
+                str_perf.c_str(),
+                stats_extra.c_str());
     }
 }
