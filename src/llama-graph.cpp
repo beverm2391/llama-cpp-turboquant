@@ -59,6 +59,19 @@ static bool can_reuse_kq_mask(
     return res;
 }
 
+static bool sampler_is_single_greedy_chain(llama_sampler * sampler) {
+    if (!sampler || llama_sampler_chain_get(sampler, -1) != sampler) {
+        return false;
+    }
+
+    if (llama_sampler_chain_n(sampler) != 1) {
+        return false;
+    }
+
+    llama_sampler * inner = llama_sampler_chain_get(sampler, 0);
+    return inner && strcmp(llama_sampler_name(inner), "greedy") == 0;
+}
+
 // impl
 
 static ggml_tensor * ggml_mul_mat_aux(
@@ -3189,13 +3202,22 @@ void llm_graph_context::build_sampling() const {
     auto inp_sampling = std::make_unique<llm_graph_input_sampling>(samplers);
     res->add_input(std::move(inp_sampling));
 
-    std::map<llama_seq_id, int32_t> seq_to_logit_row;
+    struct seq_logits_info {
+        int32_t row_idx = 0;
+        int32_t count   = 0;
+    };
+
+    std::map<llama_seq_id, seq_logits_info> seq_to_logits;
     int32_t logit_row_idx = 0;
 
     for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
         if (ubatch.output[i]) {
             llama_seq_id seq_id = ubatch.seq_id[i][0];
-            seq_to_logit_row[seq_id] = logit_row_idx;
+            auto & info = seq_to_logits[seq_id];
+            if (info.count == 0) {
+                info.row_idx = logit_row_idx;
+            }
+            info.count++;
             logit_row_idx++;
         }
     }
@@ -3209,13 +3231,22 @@ void llm_graph_context::build_sampling() const {
     ggml_tensor * logits_t = ggml_pad(ctx0, res->t_logits, 0, 1, 0, 0);
 
     for (const auto & [seq_id, sampler] : samplers) {
-        const auto it = seq_to_logit_row.find(seq_id);
+        const auto it = seq_to_logits.find(seq_id);
 
         // inactive samplers always work on the first row
-        const auto row_idx = it != seq_to_logit_row.end() ? it->second : 0;
-        const int i_out    = it != seq_to_logit_row.end() ? 1          : 0;
+        const auto row_idx = it != seq_to_logits.end() ? it->second.row_idx : 0;
+        const auto n_rows  = it != seq_to_logits.end() ? it->second.count   : 0;
+        const int i_out    = it != seq_to_logits.end() ? 1                  : 0;
 
-        ggml_tensor * logits_seq = ggml_view_1d(ctx0, logits_t, logits_t->ne[0], row_idx * logits_t->nb[1]);
+        // Greedy argmax is row-independent, so the speculative verifier can sample all
+        // same-sequence output rows on the backend. Other sampler chains keep the old
+        // one-row path because their backend kernels are not all multi-row safe.
+        const bool use_multi_row =
+            i_out && n_rows == logit_row_idx && n_rows > 1 && sampler_is_single_greedy_chain(sampler);
+
+        ggml_tensor * logits_seq = use_multi_row
+            ? res->t_logits
+            : ggml_view_1d(ctx0, logits_t, logits_t->ne[0], row_idx * logits_t->nb[1]);
         ggml_format_name(logits_seq, "logits_seq_%d", seq_id);
 
         struct llama_sampler_data data = {

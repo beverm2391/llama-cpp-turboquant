@@ -30,6 +30,19 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     throw std::runtime_error("Unsupported ctx type");
 }
 
+static bool sampler_is_single_greedy_chain(llama_sampler * sampler) {
+    if (!sampler || llama_sampler_chain_get(sampler, -1) != sampler) {
+        return false;
+    }
+
+    if (llama_sampler_chain_n(sampler) != 1) {
+        return false;
+    }
+
+    llama_sampler * inner = llama_sampler_chain_get(sampler, 0);
+    return inner && strcmp(llama_sampler_name(inner), "greedy") == 0;
+}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -1552,7 +1565,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
     return 0;
 }
 
-static std::map<llama_seq_id, uint32_t> build_seq_to_output_row(const llama_ubatch & ubatch, uint32_t row_offset) {
+static std::map<llama_seq_id, uint32_t> build_seq_to_output_row(const llama_ubatch & ubatch, uint32_t row_offset, bool first_row) {
     std::map<llama_seq_id, uint32_t> seq_to_row;
     // how many output tokens we have seen so far for this ubatch.
     uint32_t local = 0;
@@ -1564,6 +1577,10 @@ static std::map<llama_seq_id, uint32_t> build_seq_to_output_row(const llama_ubat
 
         const llama_seq_id seq_id = ubatch.seq_id[i][0];
         // row_offset is the number of output tokens before this ubatch.
+        if (first_row && seq_to_row.count(seq_id) > 0) {
+            ++local;
+            continue;
+        }
         seq_to_row[seq_id] = row_offset + local;
         ++local;
     }
@@ -1573,25 +1590,28 @@ static std::map<llama_seq_id, uint32_t> build_seq_to_output_row(const llama_ubat
 static void copy_tensor_async_ints(
     const std::map<llama_seq_id, ggml_tensor*> & tensor_map,
     const buffer_view<llama_token> & sampled,
-    const std::map<llama_seq_id, uint32_t> & seq_to_row,
+    const std::map<llama_seq_id, uint32_t> & seq_to_first_row,
+    const std::map<llama_seq_id, uint32_t> & seq_to_last_row,
     ggml_backend_sched_t sched) {
     if (!sampled.has_data()) {
         return;
     }
 
     for (const auto & [seq_id, tensor] : tensor_map) {
+        const size_t n_tokens = ggml_nelements(tensor);
+        const auto & seq_to_row = n_tokens > 1 ? seq_to_first_row : seq_to_last_row;
         auto it = seq_to_row.find(seq_id);
         if (it == seq_to_row.end()) {
             continue;
         }
 
         const uint32_t row = it->second;
-        GGML_ASSERT(row < sampled.size);
+        GGML_ASSERT(row + n_tokens <= sampled.size);
 
         GGML_ASSERT(ggml_is_contiguous(tensor) && "sampled tokens tensor must be contiguous for async copy");
 
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
-        ggml_backend_tensor_get_async(backend, tensor, sampled.data + row, 0, sizeof(sampled.data[row]));
+        ggml_backend_tensor_get_async(backend, tensor, sampled.data + row, 0, n_tokens*sizeof(sampled.data[row]));
     }
 }
 
@@ -1704,6 +1724,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // TODO: avoid this workaround in the future
     if (has_samplers && batch_inp.logits) {
         std::vector<int32_t> seq_output_count(n_seq_max, 0);
+        int32_t n_output_seqs = 0;
 
         for (int32_t i = 0; i < batch_inp.n_tokens; ++i) {
             if (batch_inp.logits[i] == 0) {
@@ -1715,12 +1736,37 @@ int llama_context::decode(const llama_batch & batch_inp) {
             for (int32_t s = 0; s < ns; ++s) {
                 const llama_seq_id seq_id = batch_inp.seq_id ? batch_inp.seq_id[i][s] : 0;
 
+                if (seq_output_count[seq_id] == 0) {
+                    n_output_seqs++;
+                }
                 seq_output_count[seq_id]++;
                 if (seq_output_count[seq_id] > 1) {
-                    LLAMA_LOG_ERROR("%s: backend sampling requires at most one output token per sequence (seq_id %d had %d)\n",
-                            __func__, seq_id, seq_output_count[seq_id]);
-                    return -1;
+                    const auto it = sampling.samplers.find(seq_id);
+                    const bool can_sample_multi_output =
+                        n_output_seqs == 1 && it != sampling.samplers.end() && sampler_is_single_greedy_chain(it->second);
+
+                    if (!can_sample_multi_output) {
+                        LLAMA_LOG_ERROR("%s: backend sampling requires at most one output token per sequence unless a single greedy sampler owns the whole batch (seq_id %d had %d)\n",
+                                __func__, seq_id, seq_output_count[seq_id]);
+                        return -1;
+                    }
                 }
+            }
+        }
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) seq_output_count.size(); ++seq_id) {
+            if (seq_output_count[seq_id] <= 1) {
+                continue;
+            }
+
+            const auto it = sampling.samplers.find(seq_id);
+            const bool can_sample_multi_output =
+                n_output_seqs == 1 && it != sampling.samplers.end() && sampler_is_single_greedy_chain(it->second);
+
+            if (!can_sample_multi_output) {
+                LLAMA_LOG_ERROR("%s: backend sampling requires at most one output token per sequence unless a single greedy sampler owns the whole batch (seq_id %d had %d, output seqs %d)\n",
+                        __func__, seq_id, seq_output_count[seq_id], n_output_seqs);
+                return -1;
             }
         }
     }
@@ -1981,15 +2027,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         // Copy backend sampling output if this ubatch produced any sampling tensors.
         if (has_samplers && (!res->t_sampled.empty() || !res->t_sampled_probs.empty() || !res->t_sampled_logits.empty())) {
-            const auto seq_to_output_row = build_seq_to_output_row(ubatch, n_outputs_prev);
+            const auto seq_to_first_output_row = build_seq_to_output_row(ubatch, n_outputs_prev, true);
+            const auto seq_to_last_output_row  = build_seq_to_output_row(ubatch, n_outputs_prev, false);
             const auto stride = n_vocab;
 
             // async copy the sampling data from the backend to the host
-            copy_tensor_async_ints(res->t_sampled, sampling.sampled, seq_to_output_row, sched.get());
+            copy_tensor_async_ints(res->t_sampled, sampling.sampled, seq_to_first_output_row, seq_to_last_output_row, sched.get());
 
-            copy_tensor_async_floats    (res->t_sampled_logits, sampling.logits,     stride, sampling.logits_count,     seq_to_output_row, sched.get());
-            copy_tensor_async_floats    (res->t_sampled_probs,  sampling.probs,      stride, sampling.probs_count,      seq_to_output_row, sched.get());
-            copy_tensor_async_candidates(res->t_candidates,     sampling.candidates, stride, sampling.candidates_count, seq_to_output_row, sched.get());
+            copy_tensor_async_floats    (res->t_sampled_logits, sampling.logits,     stride, sampling.logits_count,     seq_to_last_output_row, sched.get());
+            copy_tensor_async_floats    (res->t_sampled_probs,  sampling.probs,      stride, sampling.probs_count,      seq_to_last_output_row, sched.get());
+            copy_tensor_async_candidates(res->t_candidates,     sampling.candidates, stride, sampling.candidates_count, seq_to_last_output_row, sched.get());
         }
 
         n_outputs_prev += n_outputs;

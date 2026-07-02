@@ -212,6 +212,14 @@ static bool common_sampler_can_fast_greedy(const struct common_sampler * gsmpl, 
     return true;
 }
 
+bool common_sampler_is_fast_greedy_compatible(const struct common_sampler * gsmpl, bool grammar_first) {
+    if (!gsmpl) {
+        return false;
+    }
+
+    return common_sampler_can_fast_greedy(gsmpl, grammar_first);
+}
+
 static llama_token common_sampler_argmax_logits(struct llama_context * ctx, int idx) {
     const auto * logits = llama_get_logits_ith(ctx, idx);
     GGML_ASSERT(logits != nullptr);
@@ -230,6 +238,15 @@ static llama_token common_sampler_argmax_logits(struct llama_context * ctx, int 
     }
 
     return best;
+}
+
+static llama_token common_sampler_fast_greedy_token(struct llama_context * ctx, int idx) {
+    llama_token id = llama_get_sampled_token_ith(ctx, idx);
+    if (id != LLAMA_TOKEN_NULL) {
+        return id;
+    }
+
+    return common_sampler_argmax_logits(ctx, idx);
 }
 
 std::string common_params_sampling::print() const {
@@ -711,7 +728,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
         size_t i = 0;
         for (; i < draft.size(); i++) {
-            const llama_token id = common_sampler_argmax_logits(ctx, idxs[i]);
+            const llama_token id = common_sampler_fast_greedy_token(ctx, idxs[i]);
 
             common_sampler_accept(gsmpl, id, true);
 
@@ -723,7 +740,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
         }
 
         if (i == draft.size()) {
-            const llama_token id = common_sampler_argmax_logits(ctx, idxs[i]);
+            const llama_token id = common_sampler_fast_greedy_token(ctx, idxs[i]);
 
             common_sampler_accept(gsmpl, id, true);
 

@@ -194,6 +194,7 @@ struct server_slot {
     json json_schema;
 
     common_sampler_ptr smpl;
+    llama_sampler * smpl_spec_greedy_backend = nullptr;
 
     llama_token sampled; // in speculative mode, this is the last accepted token
 
@@ -246,6 +247,10 @@ struct server_slot {
         task.reset();
 
         llama_set_sampler(ctx_tgt, id, nullptr);
+        if (smpl_spec_greedy_backend) {
+            llama_sampler_free(smpl_spec_greedy_backend);
+            smpl_spec_greedy_backend = nullptr;
+        }
 
         // clear alora start
         alora_invocation_start = -1;
@@ -1696,15 +1701,25 @@ private:
 
             backend_sampling &= task.params.sampling.backend_sampling;
 
-            // TODO: speculative decoding requires multiple samples per batch - not supported yet
-            backend_sampling &= !(slot.can_speculate());
-
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             backend_sampling &= !need_pre_sample_logits;
 
-            // TODO: tmp until backend sampling is fully implemented
-            if (backend_sampling) {
+            if (backend_sampling && !slot.can_speculate()) {
                 llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
+            } else if (backend_sampling && common_sampler_is_fast_greedy_compatible(slot.smpl.get())) {
+                llama_sampler_chain_params lparams = llama_sampler_chain_default_params();
+                lparams.no_perf = task.params.sampling.no_perf;
+
+                auto * spec_greedy_backend = llama_sampler_chain_init(lparams);
+                llama_sampler_chain_add(spec_greedy_backend, llama_sampler_init_greedy());
+
+                if (llama_set_sampler(ctx_tgt, slot.id, spec_greedy_backend)) {
+                    slot.smpl_spec_greedy_backend = spec_greedy_backend;
+                    SLT_DBG(slot, "%s", "enabled greedy backend sampler for speculative verifier\n");
+                } else {
+                    llama_sampler_free(spec_greedy_backend);
+                    llama_set_sampler(ctx_tgt, slot.id, nullptr);
+                }
             } else {
                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
             }
