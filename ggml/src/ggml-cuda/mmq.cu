@@ -211,13 +211,20 @@ void ggml_cuda_mul_mat_q(
                                          ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
     const int64_t s13 = ne12*s12;
 
+    // Routed MoE work can be sparse and uneven enough that stream-k's fixup overhead
+    // dominates. Keep this as a runtime lever so GLM/H100 can A/B it without a rebuild.
+    static const bool disable_stream_k_moe =
+        getenv("GGML_CUDA_MMQ_DISABLE_STREAM_K_MOE") != nullptr &&
+        std::atoi(getenv("GGML_CUDA_MMQ_DISABLE_STREAM_K_MOE")) != 0;
+    const bool use_stream_k_moe = use_stream_k && !disable_stream_k_moe;
+
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
     const mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        use_stream_k, ne12};
+        use_stream_k_moe, ne12};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
