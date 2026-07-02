@@ -3640,6 +3640,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING"));
     add_opt(common_arg(
+        {"--spec-draft-defer-accept-process"},
+        {"--no-spec-draft-defer-accept-process"},
+        string_format("for MTP, mirror only the accepted verifier prefix into the draft context (default: %s)",
+                      params.speculative.draft.defer_accept_process ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.draft.defer_accept_process = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_DEFER_ACCEPT_PROCESS"));
+    add_opt(common_arg(
         {"--spec-draft-low-yield-fallback"}, "N",
         string_format("disable draft-model speculation for a sequence after N consecutive zero-accept draft batches; 0 disables fallback (default: %d)",
                       params.speculative.draft.low_yield_fallback),

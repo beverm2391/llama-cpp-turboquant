@@ -846,10 +846,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<bool> cpu_sampler_ready;
     std::vector<bool> low_yield_disabled;
     std::vector<int32_t> low_yield_streak;
+    std::vector<bool> pending_verify_active;
+    std::vector<llama_tokens> pending_verify_tokens;
+    std::vector<std::vector<llama_pos>> pending_verify_pos;
+    std::vector<std::vector<float>> pending_verify_seed_h;
 
-    // Per-seq draft length from the last draft() call, used in accept() to
-    // roll back ctx_dft's recurrent state past the AR draft's redundant
-    // pre-advancement before process() mirrored the verify batch.
+    // Per-seq draft length from the last draft() call. The deferred MTP
+    // mirror path uses this to recognize verifier batches; the adaptive
+    // fallback uses it to count low-yield draft attempts.
     std::vector<uint16_t> last_n_drafted;
 
     size_t n_backend_sampled  = 0;
@@ -858,6 +862,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     size_t n_cpu_sampler_init = 0;
     size_t n_low_yield_zero   = 0;
     size_t n_low_yield_disable = 0;
+    size_t n_deferred_batches = 0;
+    size_t n_deferred_rows    = 0;
+    size_t n_deferred_replayed_rows = 0;
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
@@ -872,9 +879,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 "MTP input row width must match the target h_nextn width");
 
         LOG_INF("%s: adding speculative implementation 'draft-mtp'\n", __func__);
-        LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d, low_yield_fallback=%d\n",
+        LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d, defer_accept_process=%d, low_yield_fallback=%d\n",
                 __func__, this->params.n_max, this->params.n_min, this->params.p_min, n_embd,
-                (int) this->params.backend_sampling, this->params.low_yield_fallback);
+                (int) this->params.backend_sampling, (int) this->params.defer_accept_process,
+                this->params.low_yield_fallback);
         LOG_INF("%s: - gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n", __func__,
                 this->params.n_gpu_layers,
                 ggml_type_name(this->params.cache_type_k),
@@ -928,6 +936,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         cpu_sampler_ready.assign(n_seq, false);
         low_yield_disabled.assign(n_seq, false);
         low_yield_streak.assign(n_seq, 0);
+        pending_verify_active.assign(n_seq, false);
+        pending_verify_tokens.assign(n_seq, {});
+        pending_verify_pos.assign(n_seq, {});
+        pending_verify_seed_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
 
         last_n_drafted.assign(n_seq, 0);
     }
@@ -966,6 +978,46 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             batch.token = nullptr;
         }
         llama_batch_free(batch);
+    }
+
+    void add_mtp_row(llama_seq_id seq_id, llama_token token, llama_pos pos, const float * h_row) {
+        common_batch_add(batch, token, pos, { seq_id }, 0);
+        std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd,
+                    h_row, (size_t) n_embd * sizeof(float));
+    }
+
+    void replay_deferred_prefix(llama_seq_id seq_id, uint16_t n_accepted) {
+        if (!pending_verify_active[seq_id]) {
+            return;
+        }
+
+        auto * ctx_dft = this->params.ctx_dft;
+        const int32_t n_rows = verify_h_rows[seq_id];
+        const int32_t n_replay = std::min<int32_t>(
+                std::min<int32_t>((int32_t) n_accepted + 1, n_rows),
+                (int32_t) pending_verify_tokens[seq_id].size());
+
+        if (n_replay <= 0) {
+            pending_verify_active[seq_id] = false;
+            return;
+        }
+
+        common_batch_clear(batch);
+        for (int32_t i = 0; i < n_replay; ++i) {
+            const float * h_row = i == 0
+                ? pending_verify_seed_h[seq_id].data()
+                : verify_h[seq_id].data() + (size_t) (i - 1) * n_embd;
+            add_mtp_row(seq_id, pending_verify_tokens[seq_id][i], pending_verify_pos[seq_id][i], h_row);
+        }
+
+        const int32_t rc = llama_decode(ctx_dft, batch);
+        if (rc != 0) {
+            GGML_ABORT("%s", string_format("%s: deferred MTP replay failed rc=%d (seq_id=%d, n_replay=%d)\n",
+                    __func__, (int) rc, (int) seq_id, (int) n_replay).c_str());
+        }
+
+        n_deferred_replayed_rows += n_replay;
+        pending_verify_active[seq_id] = false;
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -1033,34 +1085,41 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (!is_mem_shared) {
             common_batch_clear(batch);
 
-            for (int k = 0; k < n_tokens; ++k) {
-                common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
-            }
-
-            // shift the tgt embeddings to the right by one position
-            // assumes that the tokens in the batch are sequential for each sequence
-            // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
-            //                                                       ^--- this is a problem
-            // TODO:this is generally true, but would be nice to assert it
-            std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
-
-            // fill the pending embeddings from a previous run
-            auto set_h = [&](int idx, const float * h_row) {
-                std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
-            };
-
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 if (i_batch_beg[seq_id] < 0) {
                     continue;
                 }
+                pending_verify_active[seq_id] = false;
 
-                set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+                const int32_t beg = i_batch_beg[seq_id];
+                const int32_t end = i_batch_end[seq_id];
+                const int32_t n_rows = end - beg + 1;
+
+                if (params.defer_accept_process && last_n_drafted[seq_id] > 0) {
+                    pending_verify_active[seq_id] = true;
+                    pending_verify_tokens[seq_id].assign(batch_in.token + beg, batch_in.token + end + 1);
+                    pending_verify_pos[seq_id].assign(batch_in.pos + beg, batch_in.pos + end + 1);
+                    std::memcpy(pending_verify_seed_h[seq_id].data(), pending_h[seq_id].data(), row_bytes);
+                    n_deferred_batches++;
+                    n_deferred_rows += n_rows;
+                    continue;
+                }
+
+                for (int32_t i = 0; i < n_rows; ++i) {
+                    const int32_t k = beg + i;
+                    const float * h_row = i == 0
+                        ? pending_h[seq_id].data()
+                        : h_tgt + (size_t) (k - 1) * n_embd;
+                    add_mtp_row(seq_id, batch_in.token[k], batch_in.pos[k], h_row);
+                }
             }
 
-            const int32_t rc = llama_decode(ctx_dft, batch);
-            if (rc != 0) {
-                LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (pos=%d)\n", __func__, (int) rc, (int) batch_in.pos[0]);
-                return false;
+            if (batch.n_tokens > 0) {
+                const int32_t rc = llama_decode(ctx_dft, batch);
+                if (rc != 0) {
+                    LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (pos=%d)\n", __func__, (int) rc, (int) batch_in.pos[0]);
+                    return false;
+                }
             }
         }
 
@@ -1076,8 +1135,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const float * h_beg = h_tgt + (size_t) i_batch_beg[seq_id] * n_embd;
             std::memcpy(verify_h[seq_id].data(), h_beg, row_bytes * n_rows);
 
-            std::memcpy(pending_h[seq_id].data(),
-                    verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+            if (!pending_verify_active[seq_id]) {
+                std::memcpy(pending_h[seq_id].data(),
+                        verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+            }
         }
 
         return true;
@@ -1265,6 +1326,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        replay_deferred_prefix(seq_id, n_accepted);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
 
         if (params.low_yield_fallback > 0 && last_n_drafted[seq_id] > 0) {
@@ -1299,6 +1361,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         oss << ", cpu sampler init = " << n_cpu_sampler_init;
         oss << ", low-yield zeros = " << n_low_yield_zero;
         oss << ", low-yield disabled = " << n_low_yield_disable;
+        oss << ", deferred batches = " << n_deferred_batches;
+        oss << ", deferred rows = " << n_deferred_rows;
+        oss << ", deferred replayed rows = " << n_deferred_replayed_rows;
         return oss.str();
     }
 };

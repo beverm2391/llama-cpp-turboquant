@@ -308,6 +308,11 @@ struct common_params_speculative_draft {
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
+    // For MTP, defer mirroring the target verifier batch into the draft context
+    // until the accepted prefix is known. This preserves target-hidden-state
+    // replay while skipping rejected draft rows.
+    bool defer_accept_process = false;
+
     // Disable draft-model speculation for a sequence after this many consecutive
     // drafted batches accept zero tokens. 0 keeps the legacy always-try behavior.
     int32_t low_yield_fallback = 0;
