@@ -547,13 +547,24 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
+    // Backend samplers can return the final token id directly. When callers do
+    // not need probability candidates, avoid building the full vocabulary-sized
+    // CPU candidate array just to return a token the backend already chose.
+    id = llama_get_sampled_token_ith(ctx, idx);
+    if (id != LLAMA_TOKEN_NULL && gsmpl->params.n_probs <= 0) {
+        GGML_ASSERT(!grmr    && "using grammar in combination with backend sampling is not supported");
+        GGML_ASSERT(!rbudget && "using reasoning budget in combination with backend sampling is not supported");
+
+        LOG_DBG("%s: Backend sampler selected token: '%d'. Skipping CPU candidate materialization\n", __func__, id);
+
+        return id;
+    }
+
     gsmpl->set_logits(ctx, idx);
 
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
     {
-        id = llama_get_sampled_token_ith(ctx, idx);
-
         if (id != LLAMA_TOKEN_NULL) {
             LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
 
