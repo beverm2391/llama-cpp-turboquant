@@ -208,6 +208,7 @@ struct server_slot {
     double t_prompt_processing = 0.0; // ms
     double t_token_generation = 0.0;  // ms
     double t_draft_generation = 0.0;  // ms
+    double t_draft_verify = 0.0;      // ms
 
     std::function<void(int /* id_slot */)> callback_on_release;
 
@@ -242,6 +243,7 @@ struct server_slot {
         n_draft_total = 0;
         n_draft_accepted = 0;
         t_draft_generation = 0.0;
+        t_draft_verify = 0.0;
 
         task_prev = std::move(task);
         task.reset();
@@ -448,9 +450,11 @@ struct server_slot {
             timings.draft_n          = n_draft_total;
             timings.draft_n_accepted = n_draft_accepted;
             timings.draft_ms         = t_draft_generation;
+            timings.draft_verify_ms  = t_draft_verify;
             if (n_draft_total > 0) {
                 timings.draft_per_token_ms = t_draft_generation > 0.0 ? t_draft_generation / n_draft_total : 0.0;
                 timings.draft_per_second   = t_draft_generation > 0.0 ? 1e3 / t_draft_generation * n_draft_total : 0.0;
+                timings.draft_verify_per_token_ms = t_draft_verify > 0.0 ? t_draft_verify / n_draft_total : 0.0;
                 timings.draft_accept_rate  = (double) n_draft_accepted / (double) n_draft_total;
             }
         }
@@ -3718,7 +3722,9 @@ private:
                     }
 
                     GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
+                    const int64_t t_start_verify = ggml_time_us();
                     auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                    slot.t_draft_verify += (ggml_time_us() - t_start_verify) / 1000.0;
                     slot.spec_i_batch.clear();
 
                     GGML_ASSERT(accepted.size() >= 1);

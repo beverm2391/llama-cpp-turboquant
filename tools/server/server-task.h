@@ -282,7 +282,9 @@ struct result_timings {
     int32_t draft_n = 0;
     int32_t draft_n_accepted = 0;
     double draft_ms = 0.0;
+    double draft_verify_ms = 0.0;
     double draft_per_token_ms = 0.0;
+    double draft_verify_per_token_ms = 0.0;
     double draft_per_second = 0.0;
     double draft_accept_rate = 0.0;
 

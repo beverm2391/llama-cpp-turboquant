@@ -644,7 +644,9 @@ json result_timings::to_json() const {
         base["draft_n"] = draft_n;
         base["draft_n_accepted"] = draft_n_accepted;
         base["draft_ms"] = draft_ms;
+        base["draft_verify_ms"] = draft_verify_ms;
         base["draft_per_token_ms"] = draft_per_token_ms;
+        base["draft_verify_per_token_ms"] = draft_verify_per_token_ms;
         base["draft_per_second"] = draft_per_second;
         base["draft_accept_rate"] = draft_accept_rate;
     }
