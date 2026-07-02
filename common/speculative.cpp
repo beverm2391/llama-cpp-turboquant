@@ -1595,6 +1595,9 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
     size_t n_no_capture         = 0;
     size_t n_bad_seq_rows       = 0;
     size_t n_deferred_verify_rows = 0;
+    size_t n_direct_reads       = 0;
+    size_t n_direct_rows        = 0;
+    size_t n_direct_misses      = 0;
 
     common_speculative_impl_target_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_TARGET_MTP, n_seq)
@@ -1602,7 +1605,6 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
         , capture(params.target_mtp_capture)
     {
         GGML_ASSERT(this->params.ctx_tgt && "target-mtp requires ctx_tgt");
-        GGML_ASSERT(capture && "target-mtp requires capture state");
 
         pending_rows.assign(n_seq, {});
         queued.assign(n_seq, LLAMA_TOKEN_NULL);
@@ -1636,16 +1638,35 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
                 n_logit_rows++;
             }
         }
-
-        if (capture == nullptr || capture->n_captures == last_capture_seen) {
-            n_no_capture++;
+        if (n_logit_rows == 0) {
             return true;
         }
 
-        last_capture_seen = capture->n_captures;
-        n_capture_seen++;
+        std::vector<llama_token> direct_argmax;
+        uint32_t n_target_mtp = 0;
+        const llama_token * target_mtp = llama_get_target_mtp_tokens_with_count(params.ctx_tgt, &n_target_mtp);
 
-        const auto & argmax = capture->draft_argmax;
+        if (target_mtp != nullptr && n_target_mtp >= (uint32_t) n_logit_rows) {
+            direct_argmax.assign(target_mtp, target_mtp + n_logit_rows);
+            n_direct_reads++;
+            n_direct_rows += direct_argmax.size();
+        } else {
+            n_direct_misses++;
+        }
+
+        const std::vector<llama_token> * argmax_ptr = &direct_argmax;
+        if (argmax_ptr->empty()) {
+            if (capture == nullptr || capture->n_captures == last_capture_seen) {
+                n_no_capture++;
+                return true;
+            }
+
+            last_capture_seen = capture->n_captures;
+            n_capture_seen++;
+            argmax_ptr = &capture->draft_argmax;
+        }
+
+        const auto & argmax = *argmax_ptr;
         n_capture_rows += argmax.size();
 
         size_t i_col = 0;
@@ -1749,6 +1770,7 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
         oss << ", no capture = " << n_no_capture;
         oss << ", bad seq rows = " << n_bad_seq_rows;
         oss << ", deferred verify rows = " << n_deferred_verify_rows;
+        oss << ", direct reads/rows/misses = " << n_direct_reads << "/" << n_direct_rows << "/" << n_direct_misses;
         oss << ", token captures = " << (capture ? capture->n_token_captures : 0);
         oss << ", logit captures = " << (capture ? capture->n_logit_captures : 0);
         oss << ", bad tensor type = " << (capture ? capture->n_bad_type : 0);
@@ -1774,6 +1796,9 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
         oss << ",\"target_mtp_no_capture\":" << n_no_capture;
         oss << ",\"target_mtp_bad_seq_rows\":" << n_bad_seq_rows;
         oss << ",\"target_mtp_deferred_verify_rows\":" << n_deferred_verify_rows;
+        oss << ",\"target_mtp_direct_reads\":" << n_direct_reads;
+        oss << ",\"target_mtp_direct_rows\":" << n_direct_rows;
+        oss << ",\"target_mtp_direct_misses\":" << n_direct_misses;
         oss << ",\"target_mtp_token_captures\":" << (capture ? capture->n_token_captures : 0);
         oss << ",\"target_mtp_logit_captures\":" << (capture ? capture->n_logit_captures : 0);
         oss << ",\"target_mtp_bad_tensor_type\":" << (capture ? capture->n_bad_type : 0);
@@ -2380,7 +2405,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         bool has_draft_eagle3 = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3)) && params.draft.ctx_dft != nullptr;
         bool has_mtp = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_MTP)) && params.draft.ctx_dft != nullptr;
         bool has_target_mtp = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_TARGET_MTP)) &&
-            params.draft.ctx_tgt != nullptr && params.target_mtp_capture != nullptr;
+            params.draft.ctx_tgt != nullptr;
 
         bool has_ngram_cache   = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_CACHE));
         bool has_ngram_simple  = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE));

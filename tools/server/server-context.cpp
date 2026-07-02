@@ -908,15 +908,6 @@ private:
                                                COMMON_SPECULATIVE_TYPE_TARGET_MTP) != params_base.speculative.types.end();
 
         if (spec_target_mtp) {
-            if (params_base.cb_eval != nullptr) {
-                SRV_WRN("%s", "target-mtp replacing existing eval callback\n");
-            }
-
-            target_mtp_capture.reset(common_speculative_target_mtp_capture_init());
-            params_base.speculative.target_mtp_capture = target_mtp_capture.get();
-            params_base.cb_eval = common_speculative_target_mtp_eval_callback;
-            params_base.cb_eval_user_data = target_mtp_capture.get();
-
             if (getenv("LLAMA_MTP_SPEC") == nullptr) {
 #if defined(_WIN32)
                 _putenv_s("LLAMA_MTP_SPEC", "1");
@@ -926,7 +917,7 @@ private:
                 target_mtp_env_forced = true;
             }
 
-            SRV_INF("%s", "enabled target in-graph MTP capture\n");
+            SRV_INF("%s", "enabled target in-graph MTP token output\n");
         }
 
         std::string & mmproj_path = params_base.mmproj.path;

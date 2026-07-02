@@ -102,6 +102,13 @@ LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
 
+// Returns the target-context MTP draft token rows produced by the most recent
+// decode. Valid rows are [0, llama_get_target_mtp_tokens_count(ctx)).
+LLAMA_API llama_token * llama_get_target_mtp_tokens(struct llama_context * ctx);
+LLAMA_API llama_token * llama_get_target_mtp_tokens_with_count(struct llama_context * ctx, uint32_t * n_tokens);
+LLAMA_API uint32_t      llama_get_target_mtp_tokens_count(struct llama_context * ctx);
+LLAMA_API llama_token   llama_get_target_mtp_token_ith(struct llama_context * ctx, int32_t i);
+
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 

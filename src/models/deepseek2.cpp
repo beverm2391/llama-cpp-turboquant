@@ -608,6 +608,7 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
                 cb(draft_logits, "nextn_logits", il_nextn);
                 ggml_tensor * draft = ggml_argmax(ctx0, draft_logits);
                 cb(draft, "nextn_draft", il_nextn);
+                res->t_target_mtp = draft;
                 ggml_build_forward_expand(gf, draft);
             } else {
                 cb(draft_logits, "nextn_draft", il_nextn);

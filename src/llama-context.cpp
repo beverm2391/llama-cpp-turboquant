@@ -898,6 +898,31 @@ llama_token * llama_context::get_sampled_tokens()  const{
     return sampling.sampled.data;
 }
 
+llama_token * llama_context::get_target_mtp_tokens() const {
+    return target_mtp.data;
+}
+
+uint32_t llama_context::get_target_mtp_tokens_count() const {
+    return target_mtp.has_data() ? n_outputs : 0;
+}
+
+llama_token llama_context::get_target_mtp_token_ith(int32_t idx) {
+    output_reorder();
+
+    if (!target_mtp.has_data()) {
+        return LLAMA_TOKEN_NULL;
+    }
+
+    try {
+        const int64_t row = output_resolve_row(idx);
+        GGML_ASSERT(row < (int64_t) target_mtp.size);
+        return target_mtp.data[row];
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: invalid target MTP token id %d, reason: %s\n", __func__, idx, err.what());
+        return LLAMA_TOKEN_NULL;
+    }
+}
+
 float * llama_context::get_embeddings_ith(int32_t i) {
     output_reorder();
 
@@ -1924,6 +1949,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
+        auto * t_target_mtp = res->get_target_mtp();
 
         if (t_embd && res->get_embd_pooled()) {
             t_embd = res->get_embd_pooled();
@@ -2025,6 +2051,23 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
+        if (target_mtp.data && t_target_mtp && n_outputs > 0) {
+            const size_t n_tokens = std::min<size_t>((size_t) n_outputs, ggml_nelements(t_target_mtp));
+            if (n_tokens > 0) {
+                ggml_backend_t backend_mtp = ggml_backend_sched_get_tensor_backend(sched.get(), t_target_mtp);
+                GGML_ASSERT(backend_mtp != nullptr);
+                GGML_ASSERT(n_outputs_prev + n_tokens <= target_mtp.size);
+                GGML_ASSERT(ggml_is_contiguous(t_target_mtp) && "target MTP token tensor must be contiguous for async copy");
+
+                ggml_backend_tensor_get_async(
+                    backend_mtp,
+                    t_target_mtp,
+                    target_mtp.data + n_outputs_prev,
+                    0,
+                    n_tokens * sizeof(target_mtp.data[0]));
+            }
+        }
+
         // Copy backend sampling output if this ubatch produced any sampling tensors.
         if (has_samplers && (!res->t_sampled.empty() || !res->t_sampled_probs.empty() || !res->t_sampled_logits.empty())) {
             const auto seq_to_first_output_row = build_seq_to_output_row(ubatch, n_outputs_prev, true);
@@ -2117,6 +2160,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     bool has_logits     = true;
     bool has_embd       = cparams.embeddings;
     bool has_embd_nextn = cparams.embeddings_nextn;
+    bool has_target_mtp = getenv("LLAMA_MTP_SPEC") != nullptr &&
+        model.arch == LLM_ARCH_GLM_DSA &&
+        hparams.n_layer_nextn > 0;
 
     // TODO: hacky enc-dec support
     if (model.arch == LLM_ARCH_T5) {
@@ -2131,6 +2177,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     logits.size     = has_logits     ? n_vocab*n_outputs_max     : 0;
     embd.size       = has_embd       ? n_embd_out*n_outputs_max  : 0;
     embd_nextn.size = has_embd_nextn ? n_embd_out*n_outputs_max  : 0;
+    target_mtp.size = has_target_mtp ? n_outputs_max             : 0;
 
     if (has_embd_nextn && !cparams.embeddings_nextn_masked) {
         // unmasked: nextn row exists for every token in the batch, not just
@@ -2159,7 +2206,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
     const size_t new_size  =
         (logits.size + embd.size + embd_nextn.size + embd_layer_inp_float_count + backend_float_count) * sizeof(float) +
-        (                                                                         backend_token_count) * sizeof(llama_token);
+        (target_mtp.size +                                                       backend_token_count) * sizeof(llama_token);
 
     // alloc only when more than the current capacity is required
     // TODO: also consider shrinking the buffer
@@ -2176,6 +2223,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             logits.data = nullptr;
             embd.data = nullptr;
             embd_nextn.data = nullptr;
+            target_mtp.data = nullptr;
             for (auto & layer_inp : embd_layer_inp) {
                 layer_inp = {nullptr, 0};
             }
@@ -2217,6 +2265,13 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         } else {
             embd_layer_inp[il] = buffer_view<float>{nullptr, 0};
         }
+    }
+
+    target_mtp = has_target_mtp ? buffer_view<llama_token>{(llama_token *) (base + offset), target_mtp.size} : buffer_view<llama_token>{nullptr, 0};
+    offset += target_mtp.size * sizeof(llama_token);
+
+    if (target_mtp.has_data()) {
+        std::fill_n(target_mtp.data, target_mtp.size, LLAMA_TOKEN_NULL);
     }
 
     if (has_sampling) {
@@ -2317,6 +2372,10 @@ void llama_context::output_reorder() {
             for (uint64_t k = 0; k < n_embd; k++) {
                 std::swap(embd_nextn.data[i0*n_embd + k], embd_nextn.data[i1*n_embd + k]);
             }
+        }
+
+        if (target_mtp.size > 0) {
+            std::swap(target_mtp.data[i0], target_mtp.data[i1]);
         }
 
         if (embd_layer_inp.size() > 0) {
@@ -3790,6 +3849,34 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
     return ctx->get_embeddings_nextn_ith(i);
+}
+
+llama_token * llama_get_target_mtp_tokens(llama_context * ctx) {
+    ctx->synchronize();
+
+    return ctx->get_target_mtp_tokens();
+}
+
+llama_token * llama_get_target_mtp_tokens_with_count(llama_context * ctx, uint32_t * n_tokens) {
+    ctx->synchronize();
+
+    if (n_tokens != nullptr) {
+        *n_tokens = ctx->get_target_mtp_tokens_count();
+    }
+
+    return ctx->get_target_mtp_tokens();
+}
+
+uint32_t llama_get_target_mtp_tokens_count(llama_context * ctx) {
+    ctx->synchronize();
+
+    return ctx->get_target_mtp_tokens_count();
+}
+
+llama_token llama_get_target_mtp_token_ith(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+
+    return ctx->get_target_mtp_token_ith(i);
 }
 
 float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
