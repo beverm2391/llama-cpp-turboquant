@@ -308,6 +308,10 @@ struct common_params_speculative_draft {
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
+    // Disable draft-model speculation for a sequence after this many consecutive
+    // drafted batches accept zero tokens. 0 keeps the legacy always-try behavior.
+    int32_t low_yield_fallback = 0;
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;

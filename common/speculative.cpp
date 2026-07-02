@@ -844,6 +844,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     std::vector<bool> drafting;
     std::vector<bool> cpu_sampler_ready;
+    std::vector<bool> low_yield_disabled;
+    std::vector<int32_t> low_yield_streak;
 
     // Per-seq draft length from the last draft() call, used in accept() to
     // roll back ctx_dft's recurrent state past the AR draft's redundant
@@ -854,6 +856,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     size_t n_backend_missed   = 0;
     size_t n_cpu_sampled      = 0;
     size_t n_cpu_sampler_init = 0;
+    size_t n_low_yield_zero   = 0;
+    size_t n_low_yield_disable = 0;
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
@@ -868,7 +872,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 "MTP input row width must match the target h_nextn width");
 
         LOG_INF("%s: adding speculative implementation 'draft-mtp'\n", __func__);
-        LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
+        LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d, low_yield_fallback=%d\n",
+                __func__, this->params.n_max, this->params.n_min, this->params.p_min, n_embd,
+                (int) this->params.backend_sampling, this->params.low_yield_fallback);
         LOG_INF("%s: - gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n", __func__,
                 this->params.n_gpu_layers,
                 ggml_type_name(this->params.cache_type_k),
@@ -920,6 +926,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         verify_h_rows.assign(n_seq, 0);
         drafting.assign(n_seq, false);
         cpu_sampler_ready.assign(n_seq, false);
+        low_yield_disabled.assign(n_seq, false);
+        low_yield_streak.assign(n_seq, 0);
 
         last_n_drafted.assign(n_seq, 0);
     }
@@ -968,6 +976,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         auto * ctx_dft = this->params.ctx_dft;
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+
+        low_yield_disabled[seq_id] = false;
+        low_yield_streak[seq_id] = 0;
+        last_n_drafted[seq_id] = 0;
 
         if (pos_max < N - 1 && !is_mem_shared) {
             LOG_WRN("%s: ctx_dft pos_max=%d < N-1=%d - "
@@ -1080,6 +1092,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         int n_drafting = 0;
         std::fill(drafting.begin(), drafting.end(), false);
         std::fill(cpu_sampler_ready.begin(), cpu_sampler_ready.end(), false);
+        std::fill(last_n_drafted.begin(), last_n_drafted.end(), 0);
 
         const float * h_row = nullptr;
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
@@ -1088,6 +1101,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             auto & dp = dparams[seq_id];
 
             if (!dp.drafting) {
+                continue;
+            }
+            if (low_yield_disabled[seq_id]) {
+                dp.drafting = false;
                 continue;
             }
 
@@ -1102,6 +1119,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             h_row = pending_h[seq_id].data();
             std::memcpy(batch.embd + n_embd*(batch.n_tokens - 1), h_row, row_bytes);
+        }
+
+        if (batch.n_tokens == 0) {
+            return;
         }
 
         int ret = llama_decode(ctx_dft, batch);
@@ -1245,6 +1266,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+
+        if (params.low_yield_fallback > 0 && last_n_drafted[seq_id] > 0) {
+            if (n_accepted == 0) {
+                n_low_yield_zero++;
+                low_yield_streak[seq_id]++;
+                if (!low_yield_disabled[seq_id] && low_yield_streak[seq_id] >= params.low_yield_fallback) {
+                    low_yield_disabled[seq_id] = true;
+                    n_low_yield_disable++;
+                    LOG_WRN("%s: disabling MTP for seq_id=%d after %d consecutive zero-accept draft batches\n",
+                            __func__, (int) seq_id, low_yield_streak[seq_id]);
+                }
+            } else {
+                low_yield_streak[seq_id] = 0;
+            }
+        }
     }
 
     bool need_embd() const override {
@@ -1261,6 +1297,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         oss << ", backend misses = " << n_backend_missed;
         oss << ", cpu samples = " << n_cpu_sampled;
         oss << ", cpu sampler init = " << n_cpu_sampler_init;
+        oss << ", low-yield zeros = " << n_low_yield_zero;
+        oss << ", low-yield disabled = " << n_low_yield_disable;
         return oss.str();
     }
 };

@@ -229,6 +229,7 @@ int main(int argc, char ** argv) {
         printf("draft backend sampling : %s\n", params.speculative.draft.backend_sampling ? "enabled" : "disabled");
         printf("draft n max            : %d\n", params.speculative.draft.n_max);
         printf("draft p min            : %.4f\n", params.speculative.draft.p_min);
+        printf("draft low yield fb     : %d\n", params.speculative.draft.low_yield_fallback);
         printf("draft tokens proposed  : %d\n", n_draft_tokens);
         printf("draft tokens accepted  : %d\n", n_draft_accepted);
         printf("empty draft cycles     : %d\n", n_empty_drafts);
