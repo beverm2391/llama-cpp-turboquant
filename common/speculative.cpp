@@ -1588,6 +1588,10 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
     }
 
     bool process(const llama_batch & batch) override {
+        for (auto & rows : pending_rows) {
+            rows.clear();
+        }
+
         if (capture == nullptr || capture->n_captures == last_capture_seen) {
             n_no_capture++;
             return true;
@@ -1595,10 +1599,6 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
 
         last_capture_seen = capture->n_captures;
         n_capture_seen++;
-
-        for (auto & rows : pending_rows) {
-            rows.clear();
-        }
 
         const auto & argmax = capture->draft_argmax;
         n_capture_rows += argmax.size();
