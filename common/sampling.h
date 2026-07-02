@@ -52,6 +52,10 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
 // get the underlying llama_sampler_chain
 struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 
+// time spent waiting for llama_context synchronization before sampler/logit reads
+int64_t common_sampler_sync_us(const struct common_sampler * gsmpl);
+int64_t common_sampler_sync_calls(const struct common_sampler * gsmpl);
+
 // true when sampling can be reduced to deterministic argmax without changing semantics
 bool common_sampler_is_fast_greedy_compatible(const struct common_sampler * gsmpl, bool grammar_first = false);
 

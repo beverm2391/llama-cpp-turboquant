@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cinttypes>
 #include <climits>
 #include <cmath>
 #include <cstring>
@@ -166,6 +167,8 @@ struct common_sampler {
     }
 
     mutable int64_t t_total_us = 0;
+    mutable int64_t t_sync_us = 0;
+    mutable int64_t n_sync = 0;
 };
 
 static bool common_sampler_can_fast_greedy(const struct common_sampler * gsmpl, bool grammar_first) {
@@ -566,6 +569,7 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
     // TODO: measure grammar performance
 
     const double t_sampling_ms = gsmpl ? 1e-3*gsmpl->t_total_us : 0;
+    const double t_sync_ms = gsmpl ? 1e-3*gsmpl->t_sync_us : 0;
 
     llama_perf_sampler_data data_smpl;
     llama_perf_context_data data_ctx;
@@ -580,6 +584,7 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
 
         // note: the sampling time includes the samplers time + extra time spent in common/sampling
         LOG_INF("%s:    sampling time = %10.2f ms\n", __func__, t_sampling_ms);
+        LOG_INF("%s: sampling sync time = %10.2f ms / %5" PRId64 " calls\n", __func__, t_sync_ms, gsmpl->n_sync);
         LOG_INF("%s:    samplers time = %10.2f ms / %5d tokens\n", __func__, data.t_sample_ms, data.n_sample);
     }
 
@@ -615,8 +620,19 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
+int64_t common_sampler_sync_us(const struct common_sampler * gsmpl) {
+    return gsmpl ? gsmpl->t_sync_us : 0;
+}
+
+int64_t common_sampler_sync_calls(const struct common_sampler * gsmpl) {
+    return gsmpl ? gsmpl->n_sync : 0;
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
+    const int64_t t_start_sync = ggml_time_us();
     llama_synchronize(ctx);
+    gsmpl->t_sync_us += ggml_time_us() - t_start_sync;
+    gsmpl->n_sync++;
 
     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
     const auto tm = gsmpl->tm();
@@ -722,7 +738,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     result.reserve(idxs.size());
 
     if (common_sampler_can_fast_greedy(gsmpl, grammar_first)) {
+        const int64_t t_start_sync = ggml_time_us();
         llama_synchronize(ctx);
+        gsmpl->t_sync_us += ggml_time_us() - t_start_sync;
+        gsmpl->n_sync++;
 
         const auto tm = gsmpl->tm();
 

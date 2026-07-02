@@ -540,6 +540,10 @@ struct server_slot {
                 t_token_generation, n_decoded, t_gen, n_gen_second);
 
         SLT_INF(*this,
+                "sampling sync time = %10.2f ms / %5" PRId64 " calls\n",
+                common_sampler_sync_us(smpl.get()) / 1000.0, common_sampler_sync_calls(smpl.get()));
+
+        SLT_INF(*this,
                 "      total time = %10.2f ms / %5d tokens\n",
                 t_prompt_processing + t_token_generation, n_prompt_tokens_processed + n_decoded);
 
