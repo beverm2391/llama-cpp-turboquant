@@ -1601,7 +1601,10 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
     size_t n_direct_reads       = 0;
     size_t n_direct_rows        = 0;
     size_t n_direct_misses      = 0;
+    size_t n_draft_depth_limited = 0;
     int64_t t_direct_read_us    = 0;
+
+    static constexpr int32_t effective_n_max = 1;
 
     static double ratio(size_t numerator, size_t denominator) {
         return denominator == 0 ? 0.0 : (double) numerator / (double) denominator;
@@ -1621,9 +1624,13 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
         queued_valid.assign(n_seq, 0);
 
         LOG_INF("%s: adding speculative implementation 'target-mtp'\n", __func__);
-        LOG_INF("%s: - n_max=%d, n_min=%d, ctx_tgt=%s, capture=%s\n",
-                __func__, this->params.n_max, this->params.n_min,
+        LOG_INF("%s: - n_max=%d, effective_n_max=%d, n_min=%d, ctx_tgt=%s, capture=%s\n",
+                __func__, this->params.n_max, effective_n_max, this->params.n_min,
                 this->params.ctx_tgt ? "yes" : "no", capture ? "yes" : "no");
+        if (this->params.n_max > effective_n_max) {
+            LOG_WRN("%s: target-mtp currently serves one in-graph draft token per cycle; requested n_max=%d is depth-limited to %d\n",
+                    __func__, this->params.n_max, effective_n_max);
+        }
         LOG_WRN("%s: target-mtp drafts from in-graph argmax logits; use greedy/deterministic sampling for best acceptance\n",
                 __func__);
     }
@@ -1749,6 +1756,9 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
             if (dp.n_max == 0) {
                 continue;
             }
+            if (dp.n_max > effective_n_max) {
+                n_draft_depth_limited++;
+            }
 
             dp.result->push_back(queued[seq_id]);
             queued[seq_id] = LLAMA_TOKEN_NULL;
@@ -1792,6 +1802,8 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
         oss << ", bad seq rows = " << n_bad_seq_rows;
         oss << ", deferred verify rows = " << n_deferred_verify_rows;
         oss << ", pending capacity/overflow = " << pending_row_capacity << "/" << n_pending_overflow;
+        oss << ", requested/effective n max = " << params.n_max << "/" << effective_n_max;
+        oss << ", depth-limited drafts = " << n_draft_depth_limited;
         oss << ", direct reads/rows/misses = " << n_direct_reads << "/" << n_direct_rows << "/" << n_direct_misses;
         oss << ", direct hit rate = " << std::fixed << std::setprecision(3)
             << ratio(n_direct_reads, n_direct_reads + n_direct_misses);
@@ -1827,6 +1839,9 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
         oss << ",\"target_mtp_deferred_verify_rows\":" << n_deferred_verify_rows;
         oss << ",\"target_mtp_pending_capacity\":" << pending_row_capacity;
         oss << ",\"target_mtp_pending_overflow\":" << n_pending_overflow;
+        oss << ",\"target_mtp_requested_n_max\":" << params.n_max;
+        oss << ",\"target_mtp_effective_n_max\":" << effective_n_max;
+        oss << ",\"target_mtp_depth_limited_drafts\":" << n_draft_depth_limited;
         oss << ",\"target_mtp_direct_reads\":" << n_direct_reads;
         oss << ",\"target_mtp_direct_rows\":" << n_direct_rows;
         oss << ",\"target_mtp_direct_misses\":" << n_direct_misses;
