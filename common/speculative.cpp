@@ -1364,6 +1364,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         oss << ", deferred batches = " << n_deferred_batches;
         oss << ", deferred rows = " << n_deferred_rows;
         oss << ", deferred replayed rows = " << n_deferred_replayed_rows;
+        oss << ", deferred saved rows = "
+            << (n_deferred_rows >= n_deferred_replayed_rows ? n_deferred_rows - n_deferred_replayed_rows : 0);
         return oss.str();
     }
 };
