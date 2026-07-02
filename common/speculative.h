@@ -4,6 +4,14 @@
 #include "common.h"
 
 struct common_speculative;
+struct common_speculative_target_mtp_capture;
+
+common_speculative_target_mtp_capture * common_speculative_target_mtp_capture_init();
+
+void common_speculative_target_mtp_capture_free(common_speculative_target_mtp_capture * capture);
+
+// Target-context eval callback used by the experimental "target-mtp" speculator.
+bool common_speculative_target_mtp_eval_callback(struct ggml_tensor * t, bool ask, void * user_data);
 
 // comma separated list the provided types
 std::string common_speculative_type_name_str(const std::vector<enum common_speculative_type> & types);
@@ -79,3 +87,12 @@ struct common_speculative_deleter {
 };
 
 typedef std::unique_ptr<common_speculative, common_speculative_deleter> common_speculative_ptr;
+
+struct common_speculative_target_mtp_capture_deleter {
+    void operator()(common_speculative_target_mtp_capture * c) {
+        common_speculative_target_mtp_capture_free(c);
+    }
+};
+
+typedef std::unique_ptr<common_speculative_target_mtp_capture, common_speculative_target_mtp_capture_deleter>
+    common_speculative_target_mtp_capture_ptr;

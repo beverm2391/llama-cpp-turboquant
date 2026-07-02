@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -816,6 +817,8 @@ private:
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     common_speculative_ptr spec;
+    common_speculative_target_mtp_capture_ptr target_mtp_capture;
+    bool target_mtp_env_forced = false;
 
     bool add_bos_token = true;
 
@@ -857,6 +860,15 @@ private:
         model_dft.reset();
 
         llama_init.reset();
+        target_mtp_capture.reset();
+        if (target_mtp_env_forced) {
+#if defined(_WIN32)
+            _putenv_s("LLAMA_MTP_SPEC", "");
+#else
+            unsetenv("LLAMA_MTP_SPEC");
+#endif
+            target_mtp_env_forced = false;
+        }
 
         ctx_tgt = nullptr;
         model_tgt = nullptr;
@@ -890,6 +902,32 @@ private:
 
         params_base = params;
         params_base.n_outputs_max = server_n_outputs_max(params_base);
+
+        const bool spec_target_mtp = std::find(params_base.speculative.types.begin(),
+                                               params_base.speculative.types.end(),
+                                               COMMON_SPECULATIVE_TYPE_TARGET_MTP) != params_base.speculative.types.end();
+
+        if (spec_target_mtp) {
+            if (params_base.cb_eval != nullptr) {
+                SRV_WRN("%s", "target-mtp replacing existing eval callback\n");
+            }
+
+            target_mtp_capture.reset(common_speculative_target_mtp_capture_init());
+            params_base.speculative.target_mtp_capture = target_mtp_capture.get();
+            params_base.cb_eval = common_speculative_target_mtp_eval_callback;
+            params_base.cb_eval_user_data = target_mtp_capture.get();
+
+            if (getenv("LLAMA_MTP_SPEC") == nullptr) {
+#if defined(_WIN32)
+                _putenv_s("LLAMA_MTP_SPEC", "1");
+#else
+                setenv("LLAMA_MTP_SPEC", "1", 1);
+#endif
+                target_mtp_env_forced = true;
+            }
+
+            SRV_INF("%s", "enabled target in-graph MTP capture\n");
+        }
 
         std::string & mmproj_path = params_base.mmproj.path;
         bool has_mmproj = !mmproj_path.empty();
@@ -1022,6 +1060,9 @@ private:
         vocab = llama_model_get_vocab(model_tgt);
 
         n_ctx = llama_n_ctx(ctx_tgt);
+        if (spec_target_mtp) {
+            params_base.speculative.draft.ctx_tgt = ctx_tgt;
+        }
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 

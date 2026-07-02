@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "llama.h"
 #include "log.h"
 #include "ngram-cache.h"
@@ -26,12 +27,91 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"draft-simple",  COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
     {"draft-eagle3",  COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3},
     {"draft-mtp",     COMMON_SPECULATIVE_TYPE_DRAFT_MTP},
+    {"target-mtp",    COMMON_SPECULATIVE_TYPE_TARGET_MTP},
     {"ngram-simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
     {"ngram-map-k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram-map-k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
     {"ngram-mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
     {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
 };
+
+struct common_speculative_target_mtp_capture {
+    std::vector<uint8_t> tensor_data;
+    std::vector<llama_token> draft_argmax;
+    size_t n_captures = 0;
+    size_t n_bad_type = 0;
+};
+
+static bool common_speculative_target_mtp_is_capture_tensor(const ggml_tensor * t) {
+    return t != nullptr && std::strncmp(t->name, "nextn_draft", sizeof("nextn_draft") - 1) == 0;
+}
+
+common_speculative_target_mtp_capture * common_speculative_target_mtp_capture_init() {
+    return new common_speculative_target_mtp_capture();
+}
+
+void common_speculative_target_mtp_capture_free(common_speculative_target_mtp_capture * capture) {
+    delete capture;
+}
+
+bool common_speculative_target_mtp_eval_callback(ggml_tensor * t, bool ask, void * user_data) {
+    auto * capture = (common_speculative_target_mtp_capture *) user_data;
+
+    if (capture == nullptr || !common_speculative_target_mtp_is_capture_tensor(t)) {
+        return false;
+    }
+
+    if (ask) {
+        return true;
+    }
+
+    if (t->type != GGML_TYPE_F32) {
+        capture->draft_argmax.clear();
+        capture->n_bad_type++;
+        LOG_WRN("%s: ignoring %s tensor with unsupported type %s\n",
+                __func__, t->name, ggml_type_name(t->type));
+        return true;
+    }
+
+    const int64_t n_vocab = t->ne[0];
+    const int64_t n_cols  = t->ne[1];
+
+    if (n_vocab <= 0 || n_cols <= 0) {
+        capture->draft_argmax.clear();
+        return true;
+    }
+
+    const uint8_t * data = nullptr;
+    if (ggml_backend_buffer_is_host(t->buffer)) {
+        data = (const uint8_t *) t->data;
+    } else {
+        const size_t n_bytes = ggml_nbytes(t);
+        capture->tensor_data.resize(n_bytes);
+        ggml_backend_tensor_get(t, capture->tensor_data.data(), 0, n_bytes);
+        data = capture->tensor_data.data();
+    }
+
+    capture->draft_argmax.assign((size_t) n_cols, LLAMA_TOKEN_NULL);
+
+    for (int64_t col = 0; col < n_cols; ++col) {
+        const uint8_t * col_data = data + (size_t) col * t->nb[1];
+        llama_token best_token = 0;
+        float best_logit = *(const float *) col_data;
+
+        for (int64_t row = 1; row < n_vocab; ++row) {
+            const float logit = *(const float *) (col_data + (size_t) row * t->nb[0]);
+            if (logit > best_logit) {
+                best_logit = logit;
+                best_token = (llama_token) row;
+            }
+        }
+
+        capture->draft_argmax[(size_t) col] = best_token;
+    }
+
+    capture->n_captures++;
+    return true;
+}
 
 static std::string common_speculative_get_devices_str(const std::vector<ggml_backend_dev_t> & devices) {
     std::string result;
@@ -1459,6 +1539,192 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 };
 
+struct common_speculative_impl_target_mtp : public common_speculative_impl {
+    common_params_speculative_draft params;
+    common_speculative_target_mtp_capture * capture = nullptr;
+
+    std::vector<std::vector<llama_token>> pending_rows;
+    std::vector<llama_token> queued;
+    std::vector<bool> queued_valid;
+
+    size_t last_capture_seen = 0;
+    size_t n_capture_seen    = 0;
+    size_t n_capture_rows    = 0;
+    size_t n_process_rows    = 0;
+    size_t n_queue_from_process = 0;
+    size_t n_queue_from_accept  = 0;
+    size_t n_drafts_served      = 0;
+    size_t n_draft_misses       = 0;
+    size_t n_no_capture         = 0;
+    size_t n_bad_seq_rows       = 0;
+
+    common_speculative_impl_target_mtp(const common_params_speculative & params, uint32_t n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_TARGET_MTP, n_seq)
+        , params(params.draft)
+        , capture(params.target_mtp_capture)
+    {
+        GGML_ASSERT(this->params.ctx_tgt && "target-mtp requires ctx_tgt");
+        GGML_ASSERT(capture && "target-mtp requires capture state");
+
+        pending_rows.assign(n_seq, {});
+        queued.assign(n_seq, LLAMA_TOKEN_NULL);
+        queued_valid.assign(n_seq, false);
+
+        LOG_INF("%s: adding speculative implementation 'target-mtp'\n", __func__);
+        LOG_INF("%s: - n_max=%d, n_min=%d, ctx_tgt=%s, capture=%s\n",
+                __func__, this->params.n_max, this->params.n_min,
+                this->params.ctx_tgt ? "yes" : "no", capture ? "yes" : "no");
+        LOG_WRN("%s: target-mtp drafts from in-graph argmax logits; use greedy/deterministic sampling for best acceptance\n",
+                __func__);
+    }
+
+    void begin(llama_seq_id seq_id, const llama_tokens & /*prompt*/) override {
+        if (!valid_seq(seq_id)) {
+            return;
+        }
+        pending_rows[seq_id].clear();
+        queued[seq_id] = LLAMA_TOKEN_NULL;
+        queued_valid[seq_id] = false;
+    }
+
+    bool process(const llama_batch & batch) override {
+        if (capture == nullptr || capture->n_captures == last_capture_seen) {
+            n_no_capture++;
+            return true;
+        }
+
+        last_capture_seen = capture->n_captures;
+        n_capture_seen++;
+
+        for (auto & rows : pending_rows) {
+            rows.clear();
+        }
+
+        const auto & argmax = capture->draft_argmax;
+        n_capture_rows += argmax.size();
+
+        size_t i_col = 0;
+        for (int32_t i = 0; i < batch.n_tokens; ++i) {
+            if (!batch.logits[i]) {
+                continue;
+            }
+
+            if (i_col >= argmax.size()) {
+                break;
+            }
+
+            if (batch.n_seq_id[i] != 1 || batch.seq_id[i] == nullptr) {
+                i_col++;
+                continue;
+            }
+
+            const llama_seq_id seq_id = batch.seq_id[i][0];
+            if (!valid_seq(seq_id)) {
+                n_bad_seq_rows++;
+                i_col++;
+                continue;
+            }
+
+            const llama_token token = argmax[i_col];
+            pending_rows[seq_id].push_back(token);
+            n_process_rows++;
+
+            // If this was an ordinary non-speculative target row, the server
+            // will not call accept(). Queue the captured MTP proposal now so
+            // the next generation step can start speculating.
+            if (pending_rows[seq_id].size() == 1) {
+                queued[seq_id] = token;
+                queued_valid[seq_id] = token != LLAMA_TOKEN_NULL;
+                n_queue_from_process++;
+            }
+
+            i_col++;
+        }
+
+        return true;
+    }
+
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        assert(dparams.size() == n_seq);
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (!dp.drafting) {
+                continue;
+            }
+
+            if (!queued_valid[seq_id]) {
+                n_draft_misses++;
+                continue;
+            }
+
+            if (dp.n_max == 0) {
+                continue;
+            }
+
+            dp.result->push_back(queued[seq_id]);
+            queued[seq_id] = LLAMA_TOKEN_NULL;
+            queued_valid[seq_id] = false;
+            n_drafts_served++;
+        }
+    }
+
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+        if (!valid_seq(seq_id)) {
+            return;
+        }
+
+        const auto & rows = pending_rows[seq_id];
+        if (rows.empty()) {
+            return;
+        }
+
+        const size_t i_row = std::min<size_t>(n_accepted, rows.size() - 1);
+        const llama_token token = rows[i_row];
+        queued[seq_id] = token;
+        queued_valid[seq_id] = token != LLAMA_TOKEN_NULL;
+        n_queue_from_accept++;
+    }
+
+    bool need_embd() const override {
+        return false;
+    }
+
+    std::string stats_extra() const override {
+        std::ostringstream oss;
+        oss << ", target-mtp captures = " << n_capture_seen;
+        oss << ", capture rows = " << n_capture_rows;
+        oss << ", process rows = " << n_process_rows;
+        oss << ", queued process/accept = " << n_queue_from_process << "/" << n_queue_from_accept;
+        oss << ", drafts served = " << n_drafts_served;
+        oss << ", draft misses = " << n_draft_misses;
+        oss << ", no capture = " << n_no_capture;
+        oss << ", bad seq rows = " << n_bad_seq_rows;
+        oss << ", bad tensor type = " << (capture ? capture->n_bad_type : 0);
+        return oss.str();
+    }
+
+    std::string stats_json_extra() const override {
+        std::ostringstream oss;
+        oss << "\"target_mtp_captures\":" << n_capture_seen;
+        oss << ",\"target_mtp_capture_rows\":" << n_capture_rows;
+        oss << ",\"target_mtp_process_rows\":" << n_process_rows;
+        oss << ",\"target_mtp_queue_from_process\":" << n_queue_from_process;
+        oss << ",\"target_mtp_queue_from_accept\":" << n_queue_from_accept;
+        oss << ",\"target_mtp_drafts_served\":" << n_drafts_served;
+        oss << ",\"target_mtp_draft_misses\":" << n_draft_misses;
+        oss << ",\"target_mtp_no_capture\":" << n_no_capture;
+        oss << ",\"target_mtp_bad_seq_rows\":" << n_bad_seq_rows;
+        oss << ",\"target_mtp_bad_tensor_type\":" << (capture ? capture->n_bad_type : 0);
+        return oss.str();
+    }
+
+private:
+    bool valid_seq(llama_seq_id seq_id) const {
+        return seq_id >= 0 && seq_id < (llama_seq_id) n_seq;
+    }
+};
+
 // state of self-speculation (simple implementation, not ngram-map)
 struct common_speculative_impl_ngram_simple : public common_speculative_impl {
     common_params_speculative_ngram_map params;
@@ -1956,6 +2222,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:  return "draft-simple";
         case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:  return "draft-eagle3";
         case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:     return "draft-mtp";
+        case COMMON_SPECULATIVE_TYPE_TARGET_MTP:    return "target-mtp";
         case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram-simple";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:   return "ngram-map-k";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram-map-k4v";
@@ -2008,6 +2275,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
             case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
             case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+            case COMMON_SPECULATIVE_TYPE_TARGET_MTP:
                 n_max = std::max(n_max, std::max(0, spec->draft.n_max));
                 break;
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
@@ -2045,8 +2313,8 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         bool has_draft_simple = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE));
         bool has_draft_eagle3 = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3)) && params.draft.ctx_dft != nullptr;
         bool has_mtp = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_MTP)) && params.draft.ctx_dft != nullptr;
-
-
+        bool has_target_mtp = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_TARGET_MTP)) &&
+            params.draft.ctx_tgt != nullptr && params.target_mtp_capture != nullptr;
 
         bool has_ngram_cache   = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_CACHE));
         bool has_ngram_simple  = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE));
@@ -2055,7 +2323,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         bool has_ngram_mod     = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_MOD));
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 9);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 10);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
@@ -2085,6 +2353,9 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         if (has_mtp) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, params));
         }
+        if (has_target_mtp) {
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_TARGET_MTP, params));
+        }
     }
 
     std::vector<std::unique_ptr<common_speculative_impl>> impls = {};
@@ -2103,6 +2374,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
                 impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_TARGET_MTP: {
+                impls.push_back(std::make_unique<common_speculative_impl_target_mtp>(config.params, n_seq));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE: {
