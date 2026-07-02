@@ -980,8 +980,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_batch_free(batch);
     }
 
+    void add_mtp_token(llama_seq_id seq_id, llama_token token, llama_pos pos, bool logits) {
+        GGML_ASSERT(batch.seq_id[batch.n_tokens] && "llama_batch size exceeded");
+        batch.token[batch.n_tokens]    = token;
+        batch.pos[batch.n_tokens]      = pos;
+        batch.n_seq_id[batch.n_tokens] = 1;
+        batch.seq_id[batch.n_tokens][0] = seq_id;
+        batch.logits[batch.n_tokens]   = logits;
+        batch.n_tokens++;
+    }
+
     void add_mtp_row(llama_seq_id seq_id, llama_token token, llama_pos pos, const float * h_row) {
-        common_batch_add(batch, token, pos, { seq_id }, 0);
+        add_mtp_token(seq_id, token, pos, false);
         std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd,
                     h_row, (size_t) n_embd * sizeof(float));
     }
@@ -1176,7 +1186,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 cpu_sampler_ready[seq_id] = true;
             }
 
-            common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
+            add_mtp_token(seq_id, dp.id_last, dp.n_past, true);
 
             h_row = pending_h[seq_id].data();
             std::memcpy(batch.embd + n_embd*(batch.n_tokens - 1), h_row, row_bytes);
@@ -1279,9 +1289,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 if (is_mem_shared) {
                     // note: with shared memory (e.g. Gemma4 assistants) we use the same position for all draft tokens
                     // ref: https://github.com/huggingface/transformers/blob/effde20942e3f82a1b97449f60b3a48c5ff96145/docs/source/en/model_doc/gemma4_assistant.md?plain=1#L36-L37
-                    common_batch_add(batch, id, dp.n_past, { seq_id }, true);
+                    add_mtp_token(seq_id, id, dp.n_past, true);
                 } else {
-                    common_batch_add(batch, id, dp.n_past + i + 1, { seq_id }, true);
+                    add_mtp_token(seq_id, id, dp.n_past + i + 1, true);
                 }
                 std::memcpy(batch.embd + n_embd*(batch.n_tokens - 1), h_row, row_bytes);
             }
