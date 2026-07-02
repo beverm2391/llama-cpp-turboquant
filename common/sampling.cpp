@@ -168,6 +168,70 @@ struct common_sampler {
     mutable int64_t t_total_us = 0;
 };
 
+static bool common_sampler_can_fast_greedy(const struct common_sampler * gsmpl, bool grammar_first) {
+    const auto & params = gsmpl->params;
+
+    if (grammar_first || gsmpl->grmr || gsmpl->rbudget || params.n_probs > 0) {
+        return false;
+    }
+
+    if (params.mirostat != 0 || params.temp > 0.0f || params.dynatemp_range > 0.0f) {
+        return false;
+    }
+
+    if (params.has_logit_bias() || params.ignore_eos) {
+        return false;
+    }
+
+    if (params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f) {
+        return false;
+    }
+
+    if (params.dry_multiplier != 0.0f || params.top_n_sigma >= 0.0f || params.xtc_probability != 0.0f ||
+            params.typ_p < 1.0f || params.adaptive_target >= 0.0f) {
+        return false;
+    }
+
+    for (const auto & sampler : params.samplers) {
+        switch (sampler) {
+            case COMMON_SAMPLER_TYPE_PENALTIES:
+            case COMMON_SAMPLER_TYPE_DRY:
+            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+            case COMMON_SAMPLER_TYPE_TOP_K:
+            case COMMON_SAMPLER_TYPE_TYPICAL_P:
+            case COMMON_SAMPLER_TYPE_TOP_P:
+            case COMMON_SAMPLER_TYPE_MIN_P:
+            case COMMON_SAMPLER_TYPE_XTC:
+            case COMMON_SAMPLER_TYPE_TEMPERATURE:
+                break;
+            default:
+                return false;
+        }
+    }
+
+    return true;
+}
+
+static llama_token common_sampler_argmax_logits(struct llama_context * ctx, int idx) {
+    const auto * logits = llama_get_logits_ith(ctx, idx);
+    GGML_ASSERT(logits != nullptr);
+
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+
+    llama_token best = 0;
+    float best_logit = logits[0];
+    for (llama_token token_id = 1; token_id < n_vocab; ++token_id) {
+        if (logits[token_id] > best_logit) {
+            best = token_id;
+            best_logit = logits[token_id];
+        }
+    }
+
+    return best;
+}
+
 std::string common_params_sampling::print() const {
     char result[1024];
 
@@ -560,6 +624,11 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         return id;
     }
 
+    if (common_sampler_can_fast_greedy(gsmpl, grammar_first)) {
+        LOG_DBG("%s: Fast greedy selected token from logits without CPU candidate materialization\n", __func__);
+        return common_sampler_argmax_logits(ctx, idx);
+    }
+
     gsmpl->set_logits(ctx, idx);
 
     // Check if a backend sampler has already sampled a token in which case we
@@ -634,6 +703,35 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
     std::vector<llama_token> result;
     result.reserve(idxs.size());
+
+    if (common_sampler_can_fast_greedy(gsmpl, grammar_first)) {
+        llama_synchronize(ctx);
+
+        const auto tm = gsmpl->tm();
+
+        size_t i = 0;
+        for (; i < draft.size(); i++) {
+            const llama_token id = common_sampler_argmax_logits(ctx, idxs[i]);
+
+            common_sampler_accept(gsmpl, id, true);
+
+            result.push_back(id);
+
+            if (draft[i] != id) {
+                break;
+            }
+        }
+
+        if (i == draft.size()) {
+            const llama_token id = common_sampler_argmax_logits(ctx, idxs[i]);
+
+            common_sampler_accept(gsmpl, id, true);
+
+            result.push_back(id);
+        }
+
+        return result;
+    }
 
     size_t i = 0;
     for (; i < draft.size(); i++) {
