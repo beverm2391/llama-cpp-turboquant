@@ -1580,9 +1580,11 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
     common_params_speculative_draft params;
     common_speculative_target_mtp_capture * capture = nullptr;
 
-    std::vector<std::vector<llama_token>> pending_rows;
+    std::vector<llama_token> pending_rows;
+    std::vector<uint16_t> pending_row_counts;
     std::vector<llama_token> queued;
-    std::vector<bool> queued_valid;
+    std::vector<uint8_t> queued_valid;
+    uint16_t pending_row_capacity = 1;
 
     size_t last_capture_seen = 0;
     size_t n_capture_seen    = 0;
@@ -1595,6 +1597,7 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
     size_t n_no_capture         = 0;
     size_t n_bad_seq_rows       = 0;
     size_t n_deferred_verify_rows = 0;
+    size_t n_pending_overflow   = 0;
     size_t n_direct_reads       = 0;
     size_t n_direct_rows        = 0;
     size_t n_direct_misses      = 0;
@@ -1607,9 +1610,11 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
     {
         GGML_ASSERT(this->params.ctx_tgt && "target-mtp requires ctx_tgt");
 
-        pending_rows.assign(n_seq, {});
+        pending_row_capacity = (uint16_t) std::max<int32_t>(1, this->params.n_max + 1);
+        pending_rows.assign(n_seq * pending_row_capacity, LLAMA_TOKEN_NULL);
+        pending_row_counts.assign(n_seq, 0);
         queued.assign(n_seq, LLAMA_TOKEN_NULL);
-        queued_valid.assign(n_seq, false);
+        queued_valid.assign(n_seq, 0);
 
         LOG_INF("%s: adding speculative implementation 'target-mtp'\n", __func__);
         LOG_INF("%s: - n_max=%d, n_min=%d, ctx_tgt=%s, capture=%s\n",
@@ -1623,15 +1628,13 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
         if (!valid_seq(seq_id)) {
             return;
         }
-        pending_rows[seq_id].clear();
+        pending_row_counts[seq_id] = 0;
         queued[seq_id] = LLAMA_TOKEN_NULL;
-        queued_valid[seq_id] = false;
+        queued_valid[seq_id] = 0;
     }
 
     bool process(const llama_batch & batch) override {
-        for (auto & rows : pending_rows) {
-            rows.clear();
-        }
+        std::fill(pending_row_counts.begin(), pending_row_counts.end(), 0);
 
         int32_t n_logit_rows = 0;
         for (int32_t i = 0; i < batch.n_tokens; ++i) {
@@ -1697,14 +1700,21 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
             }
 
             const llama_token token = argmax_data[i_col];
-            pending_rows[seq_id].push_back(token);
+            uint16_t & n_rows_seq = pending_row_counts[seq_id];
+            if (n_rows_seq >= pending_row_capacity) {
+                n_pending_overflow++;
+                i_col++;
+                continue;
+            }
+            pending_rows[(size_t) seq_id * pending_row_capacity + n_rows_seq] = token;
+            n_rows_seq++;
             n_process_rows++;
 
             // Single-logit batches are prompt or ordinary target decodes; the
             // server will not call accept(), so queue the captured proposal
             // immediately. Multi-logit verifier batches must wait for accept()
             // to tell us which verified row survived rollback.
-            if (n_logit_rows == 1 && pending_rows[seq_id].size() == 1) {
+            if (n_logit_rows == 1 && n_rows_seq == 1) {
                 queued[seq_id] = token;
                 queued_valid[seq_id] = token != LLAMA_TOKEN_NULL;
                 n_queue_from_process++;
@@ -1738,7 +1748,7 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
 
             dp.result->push_back(queued[seq_id]);
             queued[seq_id] = LLAMA_TOKEN_NULL;
-            queued_valid[seq_id] = false;
+            queued_valid[seq_id] = 0;
             n_drafts_served++;
         }
     }
@@ -1748,13 +1758,13 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
             return;
         }
 
-        const auto & rows = pending_rows[seq_id];
-        if (rows.empty()) {
+        const uint16_t n_rows = pending_row_counts[seq_id];
+        if (n_rows == 0) {
             return;
         }
 
-        const size_t i_row = std::min<size_t>(n_accepted, rows.size() - 1);
-        const llama_token token = rows[i_row];
+        const size_t i_row = std::min<size_t>(n_accepted, n_rows - 1);
+        const llama_token token = pending_rows[(size_t) seq_id * pending_row_capacity + i_row];
         queued[seq_id] = token;
         queued_valid[seq_id] = token != LLAMA_TOKEN_NULL;
         n_queue_from_accept++;
@@ -1775,6 +1785,7 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
         oss << ", no capture = " << n_no_capture;
         oss << ", bad seq rows = " << n_bad_seq_rows;
         oss << ", deferred verify rows = " << n_deferred_verify_rows;
+        oss << ", pending capacity/overflow = " << pending_row_capacity << "/" << n_pending_overflow;
         oss << ", direct reads/rows/misses = " << n_direct_reads << "/" << n_direct_rows << "/" << n_direct_misses;
         oss << ", direct read ms = " << std::fixed << std::setprecision(3) << t_direct_read_us / 1000.0;
         oss << ", token captures = " << (capture ? capture->n_token_captures : 0);
@@ -1802,6 +1813,8 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
         oss << ",\"target_mtp_no_capture\":" << n_no_capture;
         oss << ",\"target_mtp_bad_seq_rows\":" << n_bad_seq_rows;
         oss << ",\"target_mtp_deferred_verify_rows\":" << n_deferred_verify_rows;
+        oss << ",\"target_mtp_pending_capacity\":" << pending_row_capacity;
+        oss << ",\"target_mtp_pending_overflow\":" << n_pending_overflow;
         oss << ",\"target_mtp_direct_reads\":" << n_direct_reads;
         oss << ",\"target_mtp_direct_rows\":" << n_direct_rows;
         oss << ",\"target_mtp_direct_misses\":" << n_direct_misses;
