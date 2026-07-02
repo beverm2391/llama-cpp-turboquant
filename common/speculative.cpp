@@ -877,7 +877,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         for (auto & s : smpls) {
             common_params_sampling sparams;
             sparams.no_perf  = false;
-            sparams.top_k    = 10;
+            // MTP proposals are verified by the target model before they can
+            // affect output. Greedy proposals maximize reproducibility and
+            // acceptance for deterministic serving profiles such as GLM-5.2.
+            sparams.top_k    = 1;
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
         }
@@ -887,7 +890,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (this->params.backend_sampling) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-                llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+                llama_sampler_chain_add(chain, llama_sampler_init_top_k(1));
 
                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
                     LOG_WRN("%s: backend offload failed for seq_id=%d; using CPU sampler\n", __func__, (int) seq_id);
