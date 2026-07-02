@@ -887,10 +887,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // offload draft sampling to the backend
         backend_chains.assign(n_seq, nullptr);
-        if (this->params.backend_sampling) {
+        const bool mtp_fast_argmax = this->params.backend_sampling && this->params.p_min <= 0.0f;
+        if (this->params.backend_sampling && !mtp_fast_argmax) {
+            LOG_WRN("%s: draft-mtp p_min=%.2f requires candidate probabilities; disabling backend argmax fast path\n",
+                    __func__, this->params.p_min);
+        }
+        if (mtp_fast_argmax) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-                llama_sampler_chain_add(chain, llama_sampler_init_top_k(1));
+                llama_sampler_chain_add(chain, llama_sampler_init_greedy());
 
                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
                     LOG_WRN("%s: backend offload failed for seq_id=%d; using CPU sampler\n", __func__, (int) seq_id);
@@ -1095,32 +1100,56 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
-                auto * smpl = smpls[seq_id].get();
-
-                common_sampler_sample(smpl, ctx_dft, i_batch, true);
                 h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_batch);
-                ++i_batch;
-
-                const auto * cur_p = common_sampler_get_candidates(smpl, true);
-
-                for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
-                    LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
-                            seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
-                            common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                llama_token id = LLAMA_TOKEN_NULL;
+                const bool use_backend_fast = backend_chains[seq_id] != nullptr && params.p_min <= 0.0f;
+                if (use_backend_fast) {
+                    id = llama_get_sampled_token_ith(ctx_dft, i_batch);
+                    if (id == LLAMA_TOKEN_NULL) {
+                        LOG_DBG("%s: backend greedy did not return a token for seq_id=%d; falling back to CPU sampler\n",
+                                __func__, (int) seq_id);
+                    }
                 }
 
+                auto * smpl = smpls[seq_id].get();
+                const llama_token id_sampled = id != LLAMA_TOKEN_NULL
+                    ? id
+                    : common_sampler_sample(smpl, ctx_dft, i_batch, true);
+                ++i_batch;
+
+                if (id != LLAMA_TOKEN_NULL) {
+                    common_sampler_accept(smpl, id, true);
+                }
+
+                const auto * cur_p = id == LLAMA_TOKEN_NULL
+                    ? common_sampler_get_candidates(smpl, true)
+                    : nullptr;
+
                 // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
+                id = id_sampled;
 
                 // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                if (cur_p != nullptr && cur_p->data[0].p < params.p_min) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
                     continue;
                 }
 
-                common_sampler_accept(smpl, id, true);
+                if (cur_p != nullptr) {
+                    for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                        LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+                                seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
+                                common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                    }
+                } else {
+                    LOG_DBG(" - seq_id %d, draft argmax, pos %3d: %6d '%s'\n",
+                            seq_id, i, id, common_token_to_piece(ctx_dft, id).c_str());
+                }
+
+                if (cur_p != nullptr) {
+                    common_sampler_accept(smpl, id, true);
+                }
 
                 auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
