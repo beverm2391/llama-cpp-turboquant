@@ -278,9 +278,13 @@ struct result_timings {
     double predicted_per_token_ms = 0.0;
     double predicted_per_second = 0.0;
 
-    // Optional speculative metrics - only included when > 0
+    // Optional speculative metrics - included once drafting is attempted.
     int32_t draft_n = 0;
     int32_t draft_n_accepted = 0;
+    double draft_ms = 0.0;
+    double draft_per_token_ms = 0.0;
+    double draft_per_second = 0.0;
+    double draft_accept_rate = 0.0;
 
     json to_json() const;
 };

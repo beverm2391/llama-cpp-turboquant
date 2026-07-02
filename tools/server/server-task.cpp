@@ -640,9 +640,13 @@ json result_timings::to_json() const {
         {"predicted_per_second",   predicted_per_second},
     };
 
-    if (draft_n > 0) {
+    if (draft_n > 0 || draft_ms > 0.0) {
         base["draft_n"] = draft_n;
         base["draft_n_accepted"] = draft_n_accepted;
+        base["draft_ms"] = draft_ms;
+        base["draft_per_token_ms"] = draft_per_token_ms;
+        base["draft_per_second"] = draft_per_second;
+        base["draft_accept_rate"] = draft_accept_rate;
     }
 
     return base;

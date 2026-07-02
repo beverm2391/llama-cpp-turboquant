@@ -206,6 +206,7 @@ struct server_slot {
 
     double t_prompt_processing = 0.0; // ms
     double t_token_generation = 0.0;  // ms
+    double t_draft_generation = 0.0;  // ms
 
     std::function<void(int /* id_slot */)> callback_on_release;
 
@@ -239,6 +240,7 @@ struct server_slot {
         // clear speculative decoding stats
         n_draft_total = 0;
         n_draft_accepted = 0;
+        t_draft_generation = 0.0;
 
         task_prev = std::move(task);
         task.reset();
@@ -437,9 +439,15 @@ struct server_slot {
         timings.predicted_per_second   = 1e3 / t_token_generation * n_decoded;
 
         // Add speculative metrics
-        if (n_draft_total > 0) {
+        if (n_draft_total > 0 || t_draft_generation > 0.0) {
             timings.draft_n          = n_draft_total;
             timings.draft_n_accepted = n_draft_accepted;
+            timings.draft_ms         = t_draft_generation;
+            if (n_draft_total > 0) {
+                timings.draft_per_token_ms = t_draft_generation > 0.0 ? t_draft_generation / n_draft_total : 0.0;
+                timings.draft_per_second   = t_draft_generation > 0.0 ? 1e3 / t_draft_generation * n_draft_total : 0.0;
+                timings.draft_accept_rate  = (double) n_draft_accepted / (double) n_draft_total;
+            }
         }
 
         return timings;
@@ -2744,7 +2752,41 @@ private:
 
         // generate the actual drafts (if any)
         {
+            std::vector<size_t> draft_sizes_before;
+            draft_sizes_before.reserve(drafting.size());
+            for (auto * slot_ptr : drafting) {
+                draft_sizes_before.push_back(slot_ptr->spec_draft.size());
+            }
+
+            const int64_t t_start_draft = ggml_time_us();
             common_speculative_draft(spec.get());
+            const double t_draft_ms = (ggml_time_us() - t_start_draft) / 1000.0;
+
+            size_t n_new_draft_tokens = 0;
+            for (size_t i = 0; i < drafting.size(); ++i) {
+                const auto & draft = drafting[i]->spec_draft;
+                if (draft.size() > draft_sizes_before[i]) {
+                    n_new_draft_tokens += draft.size() - draft_sizes_before[i];
+                }
+            }
+
+            if (!drafting.empty() && t_draft_ms > 0.0) {
+                if (n_new_draft_tokens > 0) {
+                    for (size_t i = 0; i < drafting.size(); ++i) {
+                        auto & draft = drafting[i]->spec_draft;
+                        if (draft.size() <= draft_sizes_before[i]) {
+                            continue;
+                        }
+                        const size_t n_slot_new = draft.size() - draft_sizes_before[i];
+                        drafting[i]->t_draft_generation += t_draft_ms * (double) n_slot_new / (double) n_new_draft_tokens;
+                    }
+                } else {
+                    const double t_draft_per_slot = t_draft_ms / (double) drafting.size();
+                    for (auto * slot_ptr : drafting) {
+                        slot_ptr->t_draft_generation += t_draft_per_slot;
+                    }
+                }
+            }
         }
 
         // make checkpoints if needed
