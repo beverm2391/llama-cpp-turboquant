@@ -1598,6 +1598,7 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
     size_t n_direct_reads       = 0;
     size_t n_direct_rows        = 0;
     size_t n_direct_misses      = 0;
+    int64_t t_direct_read_us    = 0;
 
     common_speculative_impl_target_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_TARGET_MTP, n_seq)
@@ -1642,20 +1643,24 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
             return true;
         }
 
-        std::vector<llama_token> direct_argmax;
+        const llama_token * argmax_data = nullptr;
+        size_t argmax_size = 0;
+
         uint32_t n_target_mtp = 0;
+        const int64_t t_start_direct_read = ggml_time_us();
         const llama_token * target_mtp = llama_get_target_mtp_tokens_with_count(params.ctx_tgt, &n_target_mtp);
+        t_direct_read_us += ggml_time_us() - t_start_direct_read;
 
         if (target_mtp != nullptr && n_target_mtp >= (uint32_t) n_logit_rows) {
-            direct_argmax.assign(target_mtp, target_mtp + n_logit_rows);
+            argmax_data = target_mtp;
+            argmax_size = n_logit_rows;
             n_direct_reads++;
-            n_direct_rows += direct_argmax.size();
+            n_direct_rows += argmax_size;
         } else {
             n_direct_misses++;
         }
 
-        const std::vector<llama_token> * argmax_ptr = &direct_argmax;
-        if (argmax_ptr->empty()) {
+        if (argmax_data == nullptr || argmax_size == 0) {
             if (capture == nullptr || capture->n_captures == last_capture_seen) {
                 n_no_capture++;
                 return true;
@@ -1663,11 +1668,11 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
 
             last_capture_seen = capture->n_captures;
             n_capture_seen++;
-            argmax_ptr = &capture->draft_argmax;
+            argmax_data = capture->draft_argmax.data();
+            argmax_size = capture->draft_argmax.size();
         }
 
-        const auto & argmax = *argmax_ptr;
-        n_capture_rows += argmax.size();
+        n_capture_rows += argmax_size;
 
         size_t i_col = 0;
         for (int32_t i = 0; i < batch.n_tokens; ++i) {
@@ -1675,7 +1680,7 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
                 continue;
             }
 
-            if (i_col >= argmax.size()) {
+            if (i_col >= argmax_size) {
                 break;
             }
 
@@ -1691,7 +1696,7 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
                 continue;
             }
 
-            const llama_token token = argmax[i_col];
+            const llama_token token = argmax_data[i_col];
             pending_rows[seq_id].push_back(token);
             n_process_rows++;
 
@@ -1771,6 +1776,7 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
         oss << ", bad seq rows = " << n_bad_seq_rows;
         oss << ", deferred verify rows = " << n_deferred_verify_rows;
         oss << ", direct reads/rows/misses = " << n_direct_reads << "/" << n_direct_rows << "/" << n_direct_misses;
+        oss << ", direct read ms = " << std::fixed << std::setprecision(3) << t_direct_read_us / 1000.0;
         oss << ", token captures = " << (capture ? capture->n_token_captures : 0);
         oss << ", logit captures = " << (capture ? capture->n_logit_captures : 0);
         oss << ", bad tensor type = " << (capture ? capture->n_bad_type : 0);
@@ -1799,6 +1805,7 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
         oss << ",\"target_mtp_direct_reads\":" << n_direct_reads;
         oss << ",\"target_mtp_direct_rows\":" << n_direct_rows;
         oss << ",\"target_mtp_direct_misses\":" << n_direct_misses;
+        oss << ",\"target_mtp_direct_read_us\":" << t_direct_read_us;
         oss << ",\"target_mtp_token_captures\":" << (capture ? capture->n_token_captures : 0);
         oss << ",\"target_mtp_logit_captures\":" << (capture ? capture->n_logit_captures : 0);
         oss << ",\"target_mtp_bad_tensor_type\":" << (capture ? capture->n_bad_type : 0);
