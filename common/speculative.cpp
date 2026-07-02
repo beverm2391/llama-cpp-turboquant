@@ -42,6 +42,11 @@ struct common_speculative_target_mtp_capture {
     size_t n_token_captures = 0;
     size_t n_logit_captures = 0;
     size_t n_bad_type = 0;
+    size_t n_host_reads = 0;
+    size_t n_device_reads = 0;
+    size_t n_capture_bytes = 0;
+    int64_t t_capture_us = 0;
+    int64_t t_tensor_get_us = 0;
 };
 
 static bool common_speculative_target_mtp_is_capture_tensor(const ggml_tensor * t) {
@@ -67,9 +72,13 @@ bool common_speculative_target_mtp_eval_callback(ggml_tensor * t, bool ask, void
         return true;
     }
 
+    const int64_t t_start_capture = ggml_time_us();
+    const size_t n_bytes = ggml_nbytes(t);
+
     if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_I32) {
         capture->draft_argmax.clear();
         capture->n_bad_type++;
+        capture->t_capture_us += ggml_time_us() - t_start_capture;
         LOG_WRN("%s: ignoring %s tensor with unsupported type %s\n",
                 __func__, t->name, ggml_type_name(t->type));
         return true;
@@ -78,17 +87,22 @@ bool common_speculative_target_mtp_eval_callback(ggml_tensor * t, bool ask, void
     const uint8_t * data = nullptr;
     if (ggml_backend_buffer_is_host(t->buffer)) {
         data = (const uint8_t *) t->data;
+        capture->n_host_reads++;
     } else {
-        const size_t n_bytes = ggml_nbytes(t);
         capture->tensor_data.resize(n_bytes);
+        const int64_t t_start_get = ggml_time_us();
         ggml_backend_tensor_get(t, capture->tensor_data.data(), 0, n_bytes);
+        capture->t_tensor_get_us += ggml_time_us() - t_start_get;
         data = capture->tensor_data.data();
+        capture->n_device_reads++;
     }
+    capture->n_capture_bytes += n_bytes;
 
     if (t->type == GGML_TYPE_I32) {
         const int64_t n_tokens = ggml_nelements(t);
         if (n_tokens <= 0) {
             capture->draft_argmax.clear();
+            capture->t_capture_us += ggml_time_us() - t_start_capture;
             return true;
         }
 
@@ -99,6 +113,7 @@ bool common_speculative_target_mtp_eval_callback(ggml_tensor * t, bool ask, void
 
         capture->n_captures++;
         capture->n_token_captures++;
+        capture->t_capture_us += ggml_time_us() - t_start_capture;
         return true;
     }
 
@@ -107,6 +122,7 @@ bool common_speculative_target_mtp_eval_callback(ggml_tensor * t, bool ask, void
 
     if (n_vocab <= 0 || n_cols <= 0) {
         capture->draft_argmax.clear();
+        capture->t_capture_us += ggml_time_us() - t_start_capture;
         return true;
     }
 
@@ -130,6 +146,7 @@ bool common_speculative_target_mtp_eval_callback(ggml_tensor * t, bool ask, void
 
     capture->n_captures++;
     capture->n_logit_captures++;
+    capture->t_capture_us += ggml_time_us() - t_start_capture;
     return true;
 }
 
@@ -1735,6 +1752,13 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
         oss << ", token captures = " << (capture ? capture->n_token_captures : 0);
         oss << ", logit captures = " << (capture ? capture->n_logit_captures : 0);
         oss << ", bad tensor type = " << (capture ? capture->n_bad_type : 0);
+        oss << ", capture host/device reads = " << (capture ? capture->n_host_reads : 0)
+            << "/" << (capture ? capture->n_device_reads : 0);
+        oss << ", capture bytes = " << (capture ? capture->n_capture_bytes : 0);
+        oss << ", capture ms = " << std::fixed << std::setprecision(3)
+            << (capture ? capture->t_capture_us / 1000.0 : 0.0);
+        oss << ", tensor-get ms = " << std::fixed << std::setprecision(3)
+            << (capture ? capture->t_tensor_get_us / 1000.0 : 0.0);
         return oss.str();
     }
 
@@ -1753,6 +1777,11 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
         oss << ",\"target_mtp_token_captures\":" << (capture ? capture->n_token_captures : 0);
         oss << ",\"target_mtp_logit_captures\":" << (capture ? capture->n_logit_captures : 0);
         oss << ",\"target_mtp_bad_tensor_type\":" << (capture ? capture->n_bad_type : 0);
+        oss << ",\"target_mtp_capture_host_reads\":" << (capture ? capture->n_host_reads : 0);
+        oss << ",\"target_mtp_capture_device_reads\":" << (capture ? capture->n_device_reads : 0);
+        oss << ",\"target_mtp_capture_bytes\":" << (capture ? capture->n_capture_bytes : 0);
+        oss << ",\"target_mtp_capture_us\":" << (capture ? capture->t_capture_us : 0);
+        oss << ",\"target_mtp_tensor_get_us\":" << (capture ? capture->t_tensor_get_us : 0);
         return oss.str();
     }
 
