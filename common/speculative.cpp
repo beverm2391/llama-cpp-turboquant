@@ -1577,6 +1577,7 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
     size_t n_draft_misses       = 0;
     size_t n_no_capture         = 0;
     size_t n_bad_seq_rows       = 0;
+    size_t n_deferred_verify_rows = 0;
 
     common_speculative_impl_target_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_TARGET_MTP, n_seq)
@@ -1610,6 +1611,13 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
     bool process(const llama_batch & batch) override {
         for (auto & rows : pending_rows) {
             rows.clear();
+        }
+
+        int32_t n_logit_rows = 0;
+        for (int32_t i = 0; i < batch.n_tokens; ++i) {
+            if (batch.logits[i]) {
+                n_logit_rows++;
+            }
         }
 
         if (capture == nullptr || capture->n_captures == last_capture_seen) {
@@ -1649,13 +1657,16 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
             pending_rows[seq_id].push_back(token);
             n_process_rows++;
 
-            // If this was an ordinary non-speculative target row, the server
-            // will not call accept(). Queue the captured MTP proposal now so
-            // the next generation step can start speculating.
-            if (pending_rows[seq_id].size() == 1) {
+            // Single-logit batches are prompt or ordinary target decodes; the
+            // server will not call accept(), so queue the captured proposal
+            // immediately. Multi-logit verifier batches must wait for accept()
+            // to tell us which verified row survived rollback.
+            if (n_logit_rows == 1 && pending_rows[seq_id].size() == 1) {
                 queued[seq_id] = token;
                 queued_valid[seq_id] = token != LLAMA_TOKEN_NULL;
                 n_queue_from_process++;
+            } else if (n_logit_rows > 1) {
+                n_deferred_verify_rows++;
             }
 
             i_col++;
@@ -1720,6 +1731,7 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
         oss << ", draft misses = " << n_draft_misses;
         oss << ", no capture = " << n_no_capture;
         oss << ", bad seq rows = " << n_bad_seq_rows;
+        oss << ", deferred verify rows = " << n_deferred_verify_rows;
         oss << ", token captures = " << (capture ? capture->n_token_captures : 0);
         oss << ", logit captures = " << (capture ? capture->n_logit_captures : 0);
         oss << ", bad tensor type = " << (capture ? capture->n_bad_type : 0);
@@ -1737,6 +1749,7 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
         oss << ",\"target_mtp_draft_misses\":" << n_draft_misses;
         oss << ",\"target_mtp_no_capture\":" << n_no_capture;
         oss << ",\"target_mtp_bad_seq_rows\":" << n_bad_seq_rows;
+        oss << ",\"target_mtp_deferred_verify_rows\":" << n_deferred_verify_rows;
         oss << ",\"target_mtp_token_captures\":" << (capture ? capture->n_token_captures : 0);
         oss << ",\"target_mtp_logit_captures\":" << (capture ? capture->n_logit_captures : 0);
         oss << ",\"target_mtp_bad_tensor_type\":" << (capture ? capture->n_bad_type : 0);
