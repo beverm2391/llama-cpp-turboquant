@@ -168,6 +168,8 @@ struct common_speculative_impl {
     virtual bool need_embd_nextn() const { return false; }
 
     virtual std::string stats_extra() const { return ""; }
+
+    virtual std::string stats_json_extra() const { return ""; }
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -1427,6 +1429,34 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             << " rows/" << std::fixed << std::setprecision(3) << t_draft_cont_decode_us / 1000.0 << " ms";
         return oss.str();
     }
+
+    std::string stats_json_extra() const override {
+        std::ostringstream oss;
+        oss << "\"backend_samples\":" << n_backend_sampled;
+        oss << ",\"backend_misses\":" << n_backend_missed;
+        oss << ",\"cpu_samples\":" << n_cpu_sampled;
+        oss << ",\"cpu_sampler_init\":" << n_cpu_sampler_init;
+        oss << ",\"low_yield_zeros\":" << n_low_yield_zero;
+        oss << ",\"low_yield_disabled\":" << n_low_yield_disable;
+        oss << ",\"deferred_batches\":" << n_deferred_batches;
+        oss << ",\"deferred_rows\":" << n_deferred_rows;
+        oss << ",\"deferred_replayed_rows\":" << n_deferred_replayed_rows;
+        oss << ",\"deferred_fused_seed_outputs\":" << n_deferred_fused_seed_outputs;
+        oss << ",\"deferred_saved_rows\":"
+            << (n_deferred_rows >= n_deferred_replayed_rows ? n_deferred_rows - n_deferred_replayed_rows : 0);
+        oss << ",\"mtp_process_decode_calls\":" << n_process_decode_calls;
+        oss << ",\"mtp_process_decode_rows\":" << n_process_decode_rows;
+        oss << ",\"mtp_process_decode_ms\":" << std::fixed << std::setprecision(3) << t_process_decode_us / 1000.0;
+        oss << ",\"mtp_hidden_copy_rows\":" << n_hidden_copy_rows;
+        oss << ",\"mtp_hidden_copy_ms\":" << std::fixed << std::setprecision(3) << t_hidden_copy_us / 1000.0;
+        oss << ",\"mtp_draft_seed_decode_calls\":" << n_draft_seed_decode_calls;
+        oss << ",\"mtp_draft_seed_decode_rows\":" << n_draft_seed_decode_rows;
+        oss << ",\"mtp_draft_seed_decode_ms\":" << std::fixed << std::setprecision(3) << t_draft_seed_decode_us / 1000.0;
+        oss << ",\"mtp_draft_cont_decode_calls\":" << n_draft_cont_decode_calls;
+        oss << ",\"mtp_draft_cont_decode_rows\":" << n_draft_cont_decode_rows;
+        oss << ",\"mtp_draft_cont_decode_ms\":" << std::fixed << std::setprecision(3) << t_draft_cont_decode_us / 1000.0;
+        return oss.str();
+    }
 };
 
 // state of self-speculation (simple implementation, not ngram-map)
@@ -2349,4 +2379,63 @@ void common_speculative_print_stats(const common_speculative * spec) {
                 str_perf.c_str(),
                 stats_extra.c_str());
     }
+}
+
+static std::string json_escape(const std::string & s) {
+    std::ostringstream oss;
+    for (const char c : s) {
+        switch (c) {
+            case '\\': oss << "\\\\"; break;
+            case '"':  oss << "\\\""; break;
+            case '\n': oss << "\\n";  break;
+            case '\r': oss << "\\r";  break;
+            case '\t': oss << "\\t";  break;
+            default:
+                if ((unsigned char) c < 0x20) {
+                    oss << "\\u" << std::hex << std::setw(4) << std::setfill('0') << (int) (unsigned char) c
+                        << std::dec << std::setfill(' ');
+                } else {
+                    oss << c;
+                }
+                break;
+        }
+    }
+    return oss.str();
+}
+
+std::string common_speculative_stats_json(const common_speculative * spec) {
+    std::ostringstream oss;
+    oss << "{\"implementations\":[";
+    if (spec != nullptr) {
+        bool first = true;
+        for (const auto & impl : spec->impls) {
+            if (!first) {
+                oss << ",";
+            }
+            first = false;
+
+            oss << "{";
+            oss << "\"type\":\"" << json_escape(common_speculative_type_to_str(impl->type)) << "\"";
+            oss << ",\"calls_begin\":" << impl->n_call_begin;
+            oss << ",\"calls_process\":" << impl->n_call_process;
+            oss << ",\"calls_draft\":" << impl->n_call_draft;
+            oss << ",\"calls_accept\":" << impl->n_call_accept;
+            oss << ",\"generated_drafts\":" << impl->n_gen_drafts;
+            oss << ",\"accepted_drafts\":" << impl->n_acc_drafts;
+            oss << ",\"generated_tokens\":" << impl->n_gen_tokens;
+            oss << ",\"accepted_tokens\":" << impl->n_acc_tokens;
+            oss << ",\"duration_begin_ms\":" << std::fixed << std::setprecision(3) << impl->t_begin_us / 1000.0;
+            oss << ",\"duration_process_ms\":" << std::fixed << std::setprecision(3) << impl->t_process_us / 1000.0;
+            oss << ",\"duration_draft_ms\":" << std::fixed << std::setprecision(3) << impl->t_draft_us / 1000.0;
+            oss << ",\"duration_accept_ms\":" << std::fixed << std::setprecision(3) << impl->t_accept_us / 1000.0;
+
+            const std::string extra = impl->stats_json_extra();
+            if (!extra.empty()) {
+                oss << ",\"extra\":{" << extra << "}";
+            }
+            oss << "}";
+        }
+    }
+    oss << "]}";
+    return oss.str();
 }

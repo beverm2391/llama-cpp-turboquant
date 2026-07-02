@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -28,6 +30,31 @@ static bool context_trim(llama_context * ctx, llama_pos p0) {
     return mem != nullptr && llama_memory_seq_rm(mem, 0, p0, -1);
 }
 
+static std::string json_escape(const std::string & s) {
+    std::ostringstream oss;
+    for (const char c : s) {
+        switch (c) {
+            case '\\': oss << "\\\\"; break;
+            case '"':  oss << "\\\""; break;
+            case '\n': oss << "\\n";  break;
+            case '\r': oss << "\\r";  break;
+            case '\t': oss << "\\t";  break;
+            default:
+                if ((unsigned char) c < 0x20) {
+                    oss << "\\u" << std::hex << std::uppercase;
+                    oss.width(4);
+                    oss.fill('0');
+                    oss << (int) (unsigned char) c;
+                    oss << std::dec << std::nouppercase;
+                } else {
+                    oss << c;
+                }
+                break;
+        }
+    }
+    return oss.str();
+}
+
 int main(int argc, char ** argv) {
     common_params params;
     params.prompt = "The history of the Roman Empire is a long and complex story that begins with";
@@ -40,7 +67,24 @@ int main(int argc, char ** argv) {
 
     common_init();
 
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SPECULATIVE)) {
+    std::string probe_json_path;
+    std::vector<char *> filtered_argv;
+    filtered_argv.reserve(argc);
+    filtered_argv.push_back(argv[0]);
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--mtp-probe-json") {
+            if (i + 1 >= argc) {
+                LOG_ERR("%s: --mtp-probe-json requires a path\n", __func__);
+                return 1;
+            }
+            probe_json_path = argv[++i];
+            continue;
+        }
+        filtered_argv.push_back(argv[i]);
+    }
+
+    if (!common_params_parse((int) filtered_argv.size(), filtered_argv.data(), params, LLAMA_EXAMPLE_SPECULATIVE)) {
         return 1;
     }
 
@@ -240,6 +284,37 @@ int main(int argc, char ** argv) {
         printf("==========================================\n");
 
         common_speculative_print_stats(spec.get());
+
+        if (!probe_json_path.empty()) {
+            std::ostringstream json;
+            json << "{";
+            json << "\"prompt_tokens\":" << n_prompt;
+            json << ",\"generated_tokens\":" << generated.size();
+            json << ",\"verify_forwards\":" << n_forwards;
+            json << ",\"draft_backend_sampling\":" << (params.speculative.draft.backend_sampling ? "true" : "false");
+            json << ",\"draft_n_max\":" << params.speculative.draft.n_max;
+            json << ",\"draft_p_min\":" << params.speculative.draft.p_min;
+            json << ",\"draft_low_yield_fallback\":" << params.speculative.draft.low_yield_fallback;
+            json << ",\"draft_defer_accept_process\":" << (params.speculative.draft.defer_accept_process ? "true" : "false");
+            json << ",\"draft_tokens_proposed\":" << n_draft_tokens;
+            json << ",\"draft_tokens_accepted\":" << n_draft_accepted;
+            json << ",\"empty_draft_cycles\":" << n_empty_drafts;
+            json << ",\"draft_alpha\":" << alpha;
+            json << ",\"tokens_per_forward\":" << tpf;
+            json << ",\"decode_wall_clock_s\":" << secs;
+            json << ",\"decode_tps\":" << tps;
+            json << ",\"prompt\":\"" << json_escape(params.prompt) << "\"";
+            json << ",\"speculative\":" << common_speculative_stats_json(spec.get());
+            json << "}\n";
+
+            std::ofstream out(probe_json_path);
+            if (!out) {
+                LOG_ERR("%s: failed to open JSON output path '%s'\n", __func__, probe_json_path.c_str());
+                result = 1;
+                goto done;
+            }
+            out << json.str();
+        }
     }
 
 done:

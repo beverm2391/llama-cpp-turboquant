@@ -71,6 +71,9 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
 
+// return machine-readable statistics about speculative decoding
+std::string common_speculative_stats_json(const common_speculative * spec);
+
 struct common_speculative_deleter {
     void operator()(common_speculative * s) { common_speculative_free(s); }
 };
