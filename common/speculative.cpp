@@ -39,6 +39,8 @@ struct common_speculative_target_mtp_capture {
     std::vector<uint8_t> tensor_data;
     std::vector<llama_token> draft_argmax;
     size_t n_captures = 0;
+    size_t n_token_captures = 0;
+    size_t n_logit_captures = 0;
     size_t n_bad_type = 0;
 };
 
@@ -65,19 +67,11 @@ bool common_speculative_target_mtp_eval_callback(ggml_tensor * t, bool ask, void
         return true;
     }
 
-    if (t->type != GGML_TYPE_F32) {
+    if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_I32) {
         capture->draft_argmax.clear();
         capture->n_bad_type++;
         LOG_WRN("%s: ignoring %s tensor with unsupported type %s\n",
                 __func__, t->name, ggml_type_name(t->type));
-        return true;
-    }
-
-    const int64_t n_vocab = t->ne[0];
-    const int64_t n_cols  = t->ne[1];
-
-    if (n_vocab <= 0 || n_cols <= 0) {
-        capture->draft_argmax.clear();
         return true;
     }
 
@@ -89,6 +83,31 @@ bool common_speculative_target_mtp_eval_callback(ggml_tensor * t, bool ask, void
         capture->tensor_data.resize(n_bytes);
         ggml_backend_tensor_get(t, capture->tensor_data.data(), 0, n_bytes);
         data = capture->tensor_data.data();
+    }
+
+    if (t->type == GGML_TYPE_I32) {
+        const int64_t n_tokens = ggml_nelements(t);
+        if (n_tokens <= 0) {
+            capture->draft_argmax.clear();
+            return true;
+        }
+
+        capture->draft_argmax.assign((size_t) n_tokens, LLAMA_TOKEN_NULL);
+        for (int64_t i = 0; i < n_tokens; ++i) {
+            capture->draft_argmax[(size_t) i] = (llama_token) *(const int32_t *) (data + (size_t) i * t->nb[0]);
+        }
+
+        capture->n_captures++;
+        capture->n_token_captures++;
+        return true;
+    }
+
+    const int64_t n_vocab = t->ne[0];
+    const int64_t n_cols  = t->ne[1];
+
+    if (n_vocab <= 0 || n_cols <= 0) {
+        capture->draft_argmax.clear();
+        return true;
     }
 
     capture->draft_argmax.assign((size_t) n_cols, LLAMA_TOKEN_NULL);
@@ -110,6 +129,7 @@ bool common_speculative_target_mtp_eval_callback(ggml_tensor * t, bool ask, void
     }
 
     capture->n_captures++;
+    capture->n_logit_captures++;
     return true;
 }
 
@@ -1700,6 +1720,8 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
         oss << ", draft misses = " << n_draft_misses;
         oss << ", no capture = " << n_no_capture;
         oss << ", bad seq rows = " << n_bad_seq_rows;
+        oss << ", token captures = " << (capture ? capture->n_token_captures : 0);
+        oss << ", logit captures = " << (capture ? capture->n_logit_captures : 0);
         oss << ", bad tensor type = " << (capture ? capture->n_bad_type : 0);
         return oss.str();
     }
@@ -1715,6 +1737,8 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
         oss << ",\"target_mtp_draft_misses\":" << n_draft_misses;
         oss << ",\"target_mtp_no_capture\":" << n_no_capture;
         oss << ",\"target_mtp_bad_seq_rows\":" << n_bad_seq_rows;
+        oss << ",\"target_mtp_token_captures\":" << (capture ? capture->n_token_captures : 0);
+        oss << ",\"target_mtp_logit_captures\":" << (capture ? capture->n_logit_captures : 0);
         oss << ",\"target_mtp_bad_tensor_type\":" << (capture ? capture->n_bad_type : 0);
         return oss.str();
     }

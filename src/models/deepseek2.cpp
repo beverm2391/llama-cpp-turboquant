@@ -602,14 +602,17 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
             cb(mtp_cur, "nextn_o", il_nextn);
 
             ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
-            ggml_tensor * draft = ggml_mul_mat(ctx0, head_w, mtp_cur);
-            cb(draft, "nextn_draft", il_nextn);
+            ggml_tensor * draft_logits = ggml_mul_mat(ctx0, head_w, mtp_cur);
 
             if (mtp_spec) {
+                cb(draft_logits, "nextn_logits", il_nextn);
+                ggml_tensor * draft = ggml_argmax(ctx0, draft_logits);
+                cb(draft, "nextn_draft", il_nextn);
                 ggml_build_forward_expand(gf, draft);
             } else {
-                res->t_logits = draft;
-                cur = draft;
+                cb(draft_logits, "nextn_draft", il_nextn);
+                res->t_logits = draft_logits;
+                cur = draft_logits;
             }
         }
     }
