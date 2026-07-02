@@ -3708,8 +3708,14 @@ private:
 
                 // verify and try to accept the draft
                 {
-                    // save the sampler sampler state in case we need to restore it
-                    common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+                    const bool sampler_accept_is_stateless = common_sampler_is_fast_greedy_compatible(slot.smpl.get());
+                    // Save sampler state only when accepting verifier tokens can affect later sampling.
+                    // In the deterministic greedy fast path there is no grammar, reasoning budget,
+                    // probability reporting, penalty state, or stochastic sampler state to restore.
+                    common_sampler_ptr smpl_save;
+                    if (!sampler_accept_is_stateless) {
+                        smpl_save.reset(common_sampler_clone(slot.smpl.get()));
+                    }
 
                     GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                     auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
@@ -3750,7 +3756,9 @@ private:
                             }
 
                             slot.prompt.tokens.keep_first(ckpt.n_tokens);
-                            slot.smpl = std::move(smpl_save);
+                            if (!sampler_accept_is_stateless) {
+                                slot.smpl = std::move(smpl_save);
+                            }
 
                             continue;
                         }

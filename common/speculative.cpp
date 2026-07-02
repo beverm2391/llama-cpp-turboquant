@@ -842,6 +842,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<std::vector<float>> verify_h;
     std::vector<int32_t> verify_h_rows;
 
+    std::vector<bool> drafting;
+    std::vector<bool> cpu_sampler_ready;
+
     // Per-seq draft length from the last draft() call, used in accept() to
     // roll back ctx_dft's recurrent state past the AR draft's redundant
     // pre-advancement before process() mirrored the verify batch.
@@ -915,6 +918,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+        drafting.assign(n_seq, false);
+        cpu_sampler_ready.assign(n_seq, false);
 
         last_n_drafted.assign(n_seq, 0);
     }
@@ -1073,8 +1078,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // keep track of which sequences are still drafting
         int n_drafting = 0;
-        std::vector<bool> drafting(n_seq);
-        std::vector<bool> cpu_sampler_ready(n_seq, false);
+        std::fill(drafting.begin(), drafting.end(), false);
+        std::fill(cpu_sampler_ready.begin(), cpu_sampler_ready.end(), false);
 
         const float * h_row = nullptr;
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
