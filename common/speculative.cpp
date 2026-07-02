@@ -1603,6 +1603,10 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
     size_t n_direct_misses      = 0;
     int64_t t_direct_read_us    = 0;
 
+    static double ratio(size_t numerator, size_t denominator) {
+        return denominator == 0 ? 0.0 : (double) numerator / (double) denominator;
+    }
+
     common_speculative_impl_target_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_TARGET_MTP, n_seq)
         , params(params.draft)
@@ -1782,11 +1786,17 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
         oss << ", queued process/accept = " << n_queue_from_process << "/" << n_queue_from_accept;
         oss << ", drafts served = " << n_drafts_served;
         oss << ", draft misses = " << n_draft_misses;
+        oss << ", draft hit rate = " << std::fixed << std::setprecision(3)
+            << ratio(n_drafts_served, n_drafts_served + n_draft_misses);
         oss << ", no capture = " << n_no_capture;
         oss << ", bad seq rows = " << n_bad_seq_rows;
         oss << ", deferred verify rows = " << n_deferred_verify_rows;
         oss << ", pending capacity/overflow = " << pending_row_capacity << "/" << n_pending_overflow;
         oss << ", direct reads/rows/misses = " << n_direct_reads << "/" << n_direct_rows << "/" << n_direct_misses;
+        oss << ", direct hit rate = " << std::fixed << std::setprecision(3)
+            << ratio(n_direct_reads, n_direct_reads + n_direct_misses);
+        oss << ", rows/direct read = " << std::fixed << std::setprecision(3)
+            << ratio(n_direct_rows, n_direct_reads);
         oss << ", direct read ms = " << std::fixed << std::setprecision(3) << t_direct_read_us / 1000.0;
         oss << ", token captures = " << (capture ? capture->n_token_captures : 0);
         oss << ", logit captures = " << (capture ? capture->n_logit_captures : 0);
@@ -1810,6 +1820,8 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
         oss << ",\"target_mtp_queue_from_accept\":" << n_queue_from_accept;
         oss << ",\"target_mtp_drafts_served\":" << n_drafts_served;
         oss << ",\"target_mtp_draft_misses\":" << n_draft_misses;
+        oss << ",\"target_mtp_draft_hit_rate\":" << std::fixed << std::setprecision(6)
+            << ratio(n_drafts_served, n_drafts_served + n_draft_misses);
         oss << ",\"target_mtp_no_capture\":" << n_no_capture;
         oss << ",\"target_mtp_bad_seq_rows\":" << n_bad_seq_rows;
         oss << ",\"target_mtp_deferred_verify_rows\":" << n_deferred_verify_rows;
@@ -1818,6 +1830,10 @@ struct common_speculative_impl_target_mtp : public common_speculative_impl {
         oss << ",\"target_mtp_direct_reads\":" << n_direct_reads;
         oss << ",\"target_mtp_direct_rows\":" << n_direct_rows;
         oss << ",\"target_mtp_direct_misses\":" << n_direct_misses;
+        oss << ",\"target_mtp_direct_hit_rate\":" << std::fixed << std::setprecision(6)
+            << ratio(n_direct_reads, n_direct_reads + n_direct_misses);
+        oss << ",\"target_mtp_rows_per_direct_read\":" << std::fixed << std::setprecision(6)
+            << ratio(n_direct_rows, n_direct_reads);
         oss << ",\"target_mtp_direct_read_us\":" << t_direct_read_us;
         oss << ",\"target_mtp_token_captures\":" << (capture ? capture->n_token_captures : 0);
         oss << ",\"target_mtp_logit_captures\":" << (capture ? capture->n_logit_captures : 0);
