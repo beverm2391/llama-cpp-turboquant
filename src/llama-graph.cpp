@@ -18,6 +18,68 @@
 #include <numeric>
 #include <sstream>
 #include <unordered_set>
+#include <sys/stat.h>
+
+// Runtime-tunable GLM-5.2 MoE split control. If env LLAMA_MOE_CTL names a file,
+// read "k dual" from it so split sweeps can run against one persistent server
+// load. Otherwise fall back to LLAMA_MOE_CPU_SPLIT / LLAMA_MOE_DUAL_GPU.
+static void llama_moe_split_ctl(int * out_k, bool * out_dual) {
+    static const char * ctl = getenv("LLAMA_MOE_CTL");
+    if (!ctl) {
+        const char * e = getenv("LLAMA_MOE_CPU_SPLIT");
+        const char * d = getenv("LLAMA_MOE_DUAL_GPU");
+        *out_k    = e ? atoi(e) : 0;
+        *out_dual = d && atoi(d) > 0;
+        return;
+    }
+    static int  cached_k = 0;
+    static bool cached_dual = false;
+    static long cached_mtime = -2;
+    struct stat st;
+    if (stat(ctl, &st) == 0 && (long) st.st_mtime != cached_mtime) {
+        cached_mtime = (long) st.st_mtime;
+        FILE * f = fopen(ctl, "r");
+        if (f) {
+            int k = 0, d = 0;
+            if (fscanf(f, "%d %d", &k, &d) >= 1) {
+                cached_k = k;
+                cached_dual = d > 0;
+            }
+            fclose(f);
+        }
+    }
+    *out_k = cached_k;
+    *out_dual = cached_dual;
+}
+// Lossless CPU-only reduction for host-resident GLM MoE layers. This replaces
+// ggml_mul(experts, weights) plus the add chain with one threadpool barrier,
+// preserving the same left-to-right f32 accumulation order over expert slots.
+static void glm52_moe_weighted_sum(struct ggml_tensor * dst, int ith, int nth, void *) {
+    const struct ggml_tensor * experts = dst->src[0]; // [n_embd, n_used, n_tok], f32
+    const struct ggml_tensor * weights = dst->src[1]; // [1,      n_used, n_tok], f32
+
+    const int64_t n_embd = dst->ne[0];
+    const int64_t n_tok  = dst->ne[1];
+    const int64_t n_used = experts->ne[1];
+    const int64_t r0 = (n_embd * (int64_t) ith) / nth;
+    const int64_t r1 = (n_embd * (int64_t) (ith + 1)) / nth;
+
+    char * dst_data = (char *) dst->data;
+    const char * exp_data = (const char *) experts->data;
+    const char * w_data = (const char *) weights->data;
+
+    for (int64_t t = 0; t < n_tok; ++t) {
+        for (int64_t r = r0; r < r1; ++r) {
+            float acc = 0.0f;
+            for (int64_t j = 0; j < n_used; ++j) {
+                const float e = *(const float *) (exp_data + r*experts->nb[0] + j*experts->nb[1] + t*experts->nb[2]);
+                const float w = *(const float *) (w_data + j*weights->nb[1] + t*weights->nb[2]);
+                acc += e*w;
+            }
+            *(float *) (dst_data + r*dst->nb[0] + t*dst->nb[1]) = acc;
+        }
+    }
+}
 
 // dedup helpers
 
@@ -1633,6 +1695,118 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
+    // GLM-5.2 decode-only CPU/GPU expert split for host-resident MoE layers.
+    // Copied from Hikarioyama's glm52-cpu-gpu-moe-split branch and kept
+    // env-gated so the default graph stays unchanged. For layers whose expert
+    // weights live in host memory, split the selected top-k experts by position:
+    // GPU computes the first n_used-k experts, CPU computes the last k, then a
+    // GPU-pinned add joins the partial sums. This targets the measured A100
+    // bottleneck where a small number of CPU-resident MoE layers dominate
+    // decode despite most layers already running on GPU.
+    int moe_cpu_k = 0;
+    bool moe_want_dual = false;
+    llama_moe_split_ctl(&moe_cpu_k, &moe_want_dual);
+    const bool experts_host = up_exps && up_exps->buffer && ggml_backend_buffer_is_host(up_exps->buffer);
+    const bool moe_split = moe_cpu_k > 0 && moe_cpu_k < n_expert_used &&
+        sched && backend_cpu && experts_host && !weight_before_ffn &&
+        type_op == LLM_FFN_SILU && gate_exps && !gate_up_exps &&
+        !up_exps_b && !gate_exps_b && !down_exps_b &&
+        !up_exps_s && !gate_exps_s && !down_exps_s &&
+        n_tokens == 1;
+
+    if (moe_split) {
+        ggml_backend_t be_gpu = ggml_backend_sched_get_backend(sched, 0);
+
+        ggml_backend_t be_gpu1 = nullptr;
+        if (moe_want_dual) {
+            const int nb = ggml_backend_sched_get_n_backends(sched);
+            if (nb >= 3) {
+                ggml_backend_t cand = ggml_backend_sched_get_backend(sched, 1);
+                if (cand != backend_cpu &&
+                    ggml_backend_dev_type(ggml_backend_get_device(cand)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    be_gpu1 = cand;
+                }
+            }
+        }
+
+        const int64_t n_cpu = moe_cpu_k;
+        const int64_t n_gpu = n_expert_used - n_cpu;
+        const bool    dual = be_gpu1 && n_gpu >= 2;
+        const int64_t n_g1 = dual ? (n_gpu / 2) : 0;
+        const int64_t n_g0 = n_gpu - n_g1;
+        { static bool once = false; if (!once) { once = true;
+            fprintf(stderr, "[MOE_CPU_SPLIT] active: n_cpu=%d n_gpu0=%d n_gpu1=%d n_used=%d dual=%d (per host-offloaded MoE layer)\n",
+                    (int) n_cpu, (int) n_g0, (int) n_g1, (int) n_expert_used, (int) dual); } }
+
+        ggml_tensor * inp = cur; // [n_embd, 1, n_tokens]
+
+        // Pre-stage every GPU-produced input the CPU branch needs so the CPU
+        // branch does not start by synchronizing the GPU branch.
+        ggml_tensor * inp_cpu = ggml_cont(ctx0, inp);
+        ggml_backend_sched_set_tensor_backend(sched, inp_cpu, backend_cpu);
+        ggml_build_forward_expand(gf, inp_cpu);
+        ggml_tensor * sel_all_cpu = ggml_cont(ctx0, selected_experts);
+        ggml_backend_sched_set_tensor_backend(sched, sel_all_cpu, backend_cpu);
+        ggml_build_forward_expand(gf, sel_all_cpu);
+        ggml_tensor * w_all_cpu = ggml_cont(ctx0, weights);
+        ggml_backend_sched_set_tensor_backend(sched, w_all_cpu, backend_cpu);
+        ggml_build_forward_expand(gf, w_all_cpu);
+
+        ggml_tensor * sel_g0 = ggml_view_2d(ctx0, selected_experts, n_g0, n_tokens,
+                                             selected_experts->nb[1], 0);
+        ggml_tensor * sel_g1 = dual ? ggml_view_2d(ctx0, sel_all_cpu, n_g1, n_tokens,
+                                             sel_all_cpu->nb[1], n_g0*sel_all_cpu->nb[0]) : nullptr;
+        ggml_tensor * sel_cpu = ggml_view_2d(ctx0, sel_all_cpu, n_cpu, n_tokens,
+                                             sel_all_cpu->nb[1], n_gpu*sel_all_cpu->nb[0]);
+        ggml_tensor * w_g0 = ggml_view_3d(ctx0, weights, 1, n_g0, n_tokens,
+                                           weights->nb[1], weights->nb[2], 0);
+        ggml_tensor * w_g1 = dual ? ggml_view_3d(ctx0, w_all_cpu, 1, n_g1, n_tokens,
+                                           w_all_cpu->nb[1], w_all_cpu->nb[2], n_g0*w_all_cpu->nb[1]) : nullptr;
+        ggml_tensor * w_cpu = ggml_view_3d(ctx0, w_all_cpu, 1, n_cpu, n_tokens,
+                                           w_all_cpu->nb[1], w_all_cpu->nb[2], n_gpu*w_all_cpu->nb[1]);
+
+        auto build_branch = [&](ggml_tensor * x, ggml_tensor * sel, ggml_tensor * w,
+                                int64_t cnt, ggml_backend_t be) -> ggml_tensor * {
+            ggml_tensor * b_up   = build_lora_mm_id(up_exps,   x, sel);
+            ggml_tensor * b_gate = build_lora_mm_id(gate_exps, x, sel);
+            ggml_tensor * b_swi  = ggml_swiglu_split(ctx0, b_gate, b_up);
+            ggml_tensor * b_down = build_lora_mm_id(down_exps, b_swi, sel);
+            ggml_tensor * b_exp  = ggml_mul(ctx0, b_down, w);
+            ggml_backend_sched_set_tensor_backend(sched, b_up,   be);
+            ggml_backend_sched_set_tensor_backend(sched, b_gate, be);
+            ggml_backend_sched_set_tensor_backend(sched, b_swi,  be);
+            ggml_backend_sched_set_tensor_backend(sched, b_down, be);
+            ggml_backend_sched_set_tensor_backend(sched, b_exp,  be);
+
+            ggml_tensor * acc = ggml_view_2d(ctx0, b_exp, n_embd, n_tokens, b_exp->nb[2], 0);
+            for (int64_t i = 1; i < cnt; i++) {
+                ggml_tensor * v = ggml_view_2d(ctx0, b_exp, n_embd, n_tokens, b_exp->nb[2], i*b_exp->nb[1]);
+                acc = ggml_add(ctx0, acc, v);
+                ggml_backend_sched_set_tensor_backend(sched, acc, be);
+            }
+            return acc;
+        };
+
+        ggml_tensor * part_g0 = build_branch(inp, sel_g0, w_g0, n_g0, be_gpu);
+        ggml_build_forward_expand(gf, part_g0);
+        ggml_tensor * part_g1 = nullptr;
+        if (dual) {
+            part_g1 = build_branch(inp_cpu, sel_g1, w_g1, n_g1, be_gpu1);
+            ggml_build_forward_expand(gf, part_g1);
+        }
+        ggml_tensor * part_cpu = build_branch(inp_cpu, sel_cpu, w_cpu, n_cpu, backend_cpu);
+        ggml_build_forward_expand(gf, part_cpu);
+
+        ggml_tensor * moe_out = ggml_add(ctx0, part_g0, part_cpu);
+        ggml_backend_sched_set_tensor_backend(sched, moe_out, be_gpu);
+        if (dual) {
+            moe_out = ggml_add(ctx0, moe_out, part_g1);
+            ggml_backend_sched_set_tensor_backend(sched, moe_out, be_gpu);
+        }
+        cb(moe_out, "ffn_moe_out", il);
+        return moe_out;
+    }
+
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
         ggml_tensor * repeated = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);
@@ -1794,6 +1968,26 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_down_scaled", il);
     }
 
+    static const int use_fused_wsum_env = []{
+        const char * e = getenv("GLM52_FUSED_WSUM");
+        return e ? atoi(e) : 0;
+    }();
+    const bool down_experts_host = down_exps && down_exps->buffer && ggml_backend_buffer_is_host(down_exps->buffer);
+    const bool use_fused_wsum = use_fused_wsum_env > 0 && down_experts_host && !weight_before_ffn &&
+        weights != nullptr && n_tokens <= 2 && (int64_t) hparams.n_expert_used == n_expert_used &&
+        experts->type == GGML_TYPE_F32 && weights->type == GGML_TYPE_F32;
+
+    if (use_fused_wsum) {
+        { static bool once = false; if (!once) { once = true;
+            fprintf(stderr, "[GLM52_FUSED_WSUM] active for host-resident MoE layers (n_used=%d, n_tokens<=2)\n", (int) n_expert_used);
+        } }
+        ggml_tensor * wsum_args[2] = { experts, weights };
+        ggml_tensor * moe_out = ggml_custom_4d(ctx0, GGML_TYPE_F32, n_embd, n_tokens, 1, 1,
+                wsum_args, 2, glm52_moe_weighted_sum, GGML_N_TASKS_MAX, nullptr);
+        cb(moe_out, "ffn_moe_out", il);
+        ggml_build_forward_expand(gf, moe_out);
+        return moe_out;
+    }
     if (!weight_before_ffn) {
         experts = ggml_mul(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);

@@ -2924,17 +2924,33 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     // TQ weight types use dequant-to-f16 cuBLAS path only (no mmvq/mmq kernels)
     const bool is_tq_weight_id = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
+    static const int dbg_moe_trace = []{ const char * e = getenv("GLM52_MOE_TRACE"); return e ? atoi(e) : 0; }();
+    static long long g_mmid_cuda_calls = 0;
+    auto trace_branch = [&](const char * branch) {
+        if (!dbg_moe_trace) {
+            return;
+        }
+        g_mmid_cuda_calls++;
+        if (g_mmid_cuda_calls <= 16 || dbg_moe_trace >= 2 || g_mmid_cuda_calls % 64 == 0) {
+            fprintf(stderr, "[GLM52_MOE_TRACE] cuda_mul_mat_id call#%lld dev=%d branch=%s src0=%s tq=%d ne0=%lld ne1=%lld experts=%lld tokens=%lld active_experts=%lld ne12=%lld\n",
+                g_mmid_cuda_calls, ggml_cuda_get_device(), branch, ggml_type_name(src0->type), (int) is_tq_weight_id,
+                (long long) ne0, (long long) ne1, (long long) ne02, (long long) ne12,
+                (long long) ids->ne[0], (long long) src1->ne[2]);
+        }
+    };
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type) && !is_tq_weight_id) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
+                    trace_branch("mmvq");
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;
                 }
             } else if (!ggml_is_quantized(src0->type)) {
                 if (GGML_CUDA_CC_IS_AMD(cc)) {
+                    trace_branch("mmvf_amd");
                     ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
                     return;
                 }
@@ -2942,15 +2958,19 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+            trace_branch("mmq");
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
 
         if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+            trace_branch("mmf");
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
             return;
         }
     }
+
+    trace_branch("sorted_loop");
 
     // note: this path should not be reached when recording CUDA graphs, because it requires stream synchronization
     // TODO: add asserts to verify this. should work with CUDA, HIP, etc.

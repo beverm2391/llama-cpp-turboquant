@@ -1551,6 +1551,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     static const int dbg_sync = []{ const char * e = getenv("GGML_SCHED_SYNC_COUNT"); return e ? atoi(e) : 0; }();
     static long long g_calls=0, g_war=0, g_inp=0, g_moe_ib=0, g_moe_ids=0, g_gen_ib=0, g_gen_sp=0, g_splits=0, g_xin=0;
     long long c_war=0,c_inp=0,c_moe_ib=0,c_moe_ids=0,c_gen_ib=0,c_gen_sp=0,c_xin=0;
+    static const int dbg_moe_trace = []{ const char * e = getenv("GLM52_MOE_TRACE"); return e ? atoi(e) : 0; }();
+    static long long g_mmid_cpu=0, g_mmid_gpu=0, g_mmid_input_weight=0;
+    long long c_mmid_cpu=0, c_mmid_gpu=0, c_mmid_input_weight=0;
     auto dbg_is_gpu = [](ggml_backend_t b){ return ggml_backend_dev_type(ggml_backend_get_device(b)) != GGML_BACKEND_DEVICE_TYPE_CPU; };
     // [SYNC_TIME] dbg_sync>=3: per-token wall-clock buckets (us). Decisive for overlap:
     //   in_gpu  = time host blocked in GPU splits' input loop (sync waits incl. join wait for GPU branch)
@@ -1566,6 +1569,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
         int64_t tk_t0 = (dbg_sync >= 3) ? ggml_time_us() : 0;
+        if (dbg_moe_trace) {
+            const bool split_gpu = dbg_is_gpu(split_backend);
+            for (int node_id = 0; node_id < split->graph.n_nodes; node_id++) {
+                ggml_tensor * node = split->graph.nodes[node_id];
+                if (node->op == GGML_OP_MUL_MAT_ID) {
+                    if (split_gpu) {
+                        c_mmid_gpu++;
+                    } else {
+                        c_mmid_cpu++;
+                    }
+                }
+            }
+        }
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1602,6 +1618,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     (node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)
                     //|| (node->src[1] == input_cpy && node->op == GGML_OP_ADD_ID) /* GGML_OP_ADD_ID weights are small and not worth splitting */
                     )) {
+
+                    if (dbg_moe_trace) c_mmid_input_weight++;
 
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
@@ -1781,6 +1799,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
     }
 
+    if (dbg_moe_trace) {
+        g_mmid_cpu += c_mmid_cpu;
+        g_mmid_gpu += c_mmid_gpu;
+        g_mmid_input_weight += c_mmid_input_weight;
+        if (g_calls <= 5 || dbg_moe_trace >= 2 || g_calls % 64 == 0) {
+            fprintf(stderr, "[GLM52_MOE_TRACE] sched call#%lld splits=%d mul_mat_id{cpu=%lld gpu=%lld host_weight_inputs=%lld} CUMUL/call{cpu=%.2f gpu=%.2f host_weight_inputs=%.2f}\n",
+                g_calls, sched->n_splits, c_mmid_cpu, c_mmid_gpu, c_mmid_input_weight,
+                (double) g_mmid_cpu / g_calls, (double) g_mmid_gpu / g_calls,
+                (double) g_mmid_input_weight / g_calls);
+        }
+    }
+
     return GGML_STATUS_SUCCESS;
 }
 
@@ -1833,12 +1863,21 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->splits = (ggml_backend_sched_split *) calloc(initial_splits_capacity, sizeof(sched->splits[0]));
     sched->splits_capacity = initial_splits_capacity;
 
+    // GLM-5.2 CPU/GPU MoE split needs per-backend events even when
+    // n_copies == 1; otherwise the scheduler's WAR guard falls back to
+    // host-blocking synchronize and destroys CPU/GPU overlap. Env-gated so
+    // non-split runs keep stock event allocation.
+    static const bool moe_split_events = []{
+        if (getenv("LLAMA_MOE_CTL")) return true;
+        const char * e = getenv("LLAMA_MOE_CPU_SPLIT");
+        return e && atoi(e) > 0;
+    }();
     for (int b = 0; b < n_backends; b++) {
         sched->backends[b] = backends[b];
         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
         GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
 
-        if (sched->n_copies > 1) {
+        if (sched->n_copies > 1 || moe_split_events) {
             for (int c = 0; c < sched->n_copies; c++) {
                 sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
             }
